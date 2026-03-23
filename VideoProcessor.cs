@@ -13,7 +13,7 @@ class VideoProcessor
     // ── Tunable constants ──────────────────────────────────────────────────────
     private const double CROP_FRACTION  = 0.20;   // bottom-left 20%
     private const int    BLACK_THRESH   = 30;      // pixel ≤ 30 on all channels → "black"
-    private const int    WHITE_THRESH   = 225;     // pixel ≥ 225 on all channels → "white"
+    // White pixels are left as-is — only black pixels are replaced with the target colour
 
     // Target colour: #FF000064  (R=255 G=0 B=0 A=100)
     // MP4/AVI → alpha is dropped; use WebM/MOV for full RGBA output.
@@ -67,8 +67,6 @@ class VideoProcessor
         using var srcFrame    = new Mat();
         using var cropped     = new Mat();
         using var blackMask   = new Mat();
-        using var whiteMask   = new Mat();
-        using var combined    = new Mat();
         using var processed   = new Mat();
 
         int frameIdx = 0;
@@ -78,32 +76,24 @@ class VideoProcessor
             var roi = new Rect(cropX, cropY, cropW, cropH);
             new Mat(srcFrame, roi).CopyTo(cropped);
 
-            // 2. Build pixel-replacement masks
-            //    Black mask: every channel in [0..BLACK_THRESH]
+            // 2. Build black-only mask: every channel in [0..BLACK_THRESH]
+            //    White pixels are intentionally left untouched.
             Cv2.InRange(cropped,
                 new Scalar(0,           0,           0),
                 new Scalar(BLACK_THRESH, BLACK_THRESH, BLACK_THRESH),
                 blackMask);
 
-            //    White mask: every channel in [WHITE_THRESH..255]
-            Cv2.InRange(cropped,
-                new Scalar(WHITE_THRESH, WHITE_THRESH, WHITE_THRESH),
-                new Scalar(255,          255,          255),
-                whiteMask);
-
-            Cv2.BitwiseOr(blackMask, whiteMask, combined);
-
-            // 3. Replace matched pixels with #FF0000 (+ alpha if needed)
+            // 3. Replace black pixels with #FF0000 (+ alpha if needed); white stays white
             if (wantAlpha)
             {
                 // Convert to BGRA so we can write alpha
                 Cv2.CvtColor(cropped, processed, ColorConversionCodes.BGR2BGRA);
-                processed.SetTo(RED_BGRA, combined);
+                processed.SetTo(RED_BGRA, blackMask);
             }
             else
             {
                 cropped.CopyTo(processed);
-                processed.SetTo(RED_BGR, combined);
+                processed.SetTo(RED_BGR, blackMask);
             }
 
             writer.Write(processed);
