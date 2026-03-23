@@ -1,0 +1,314 @@
+// VideoProcessor.cs
+// NuGet packages required:
+//   OpenCvSharp4
+//   OpenCvSharp4.runtime.win (Windows) OR OpenCvSharp4.runtime.ubuntu.20.04-x64 (Linux)
+//
+// dotnet add package OpenCvSharp4
+// dotnet add package OpenCvSharp4.runtime.win
+
+using OpenCvSharp;
+using System.Text;
+
+class VideoProcessor
+{
+    // ── Tunable constants ──────────────────────────────────────────────────────
+    private const double CROP_FRACTION    = 0.20;  // bottom-left 20% of the frame
+    private const int    DENOISE_SIZE     = 3;     // median blur kernel, must be odd (1 = off)
+    private const int    BORDER_THICKNESS = 2;     // thickness when redrawing the box border
+
+    // Number of columns (squares per row).
+    private const int NUM_COLS = 32;
+
+    // What fraction of each cell's width/height to sample at the centre.
+    // 0.5 = middle 50% of the cell — avoids edges that may have bleed.
+    private const double SAMPLE_FRACTION = 0.5;
+
+    // Fraction of sampled pixels that must be white for a cell to count as 1.
+    private const double WHITE_VOTE_THRESHOLD = 0.5;
+
+    // HSV range for detecting the red bounding box (red wraps at 0°/180°)
+    private static readonly Scalar RED_HSV_LO1 = new Scalar(0,   80, 80);
+    private static readonly Scalar RED_HSV_HI1 = new Scalar(10, 255, 255);
+    private static readonly Scalar RED_HSV_LO2 = new Scalar(165, 80, 80);
+    private static readonly Scalar RED_HSV_HI2 = new Scalar(180, 255, 255);
+
+    private const double MIN_BOX_AREA = 500;
+
+    // Output colour scalars (OpenCV is BGR)
+    private static readonly Scalar BLACK_BGR  = new Scalar(0, 0, 0);
+    private static readonly Scalar BLACK_BGRA = new Scalar(0, 0, 0, 255);
+    private static readonly Scalar RED_BGR    = new Scalar(0, 0, 255);
+    private static readonly Scalar RED_BGRA   = new Scalar(0, 0, 255, 100); // A = 0x64 = 100
+    private static readonly Scalar WHITE_BGR  = new Scalar(255, 255, 255);
+    private static readonly Scalar WHITE_BGRA = new Scalar(255, 255, 255, 255);
+
+    // ──────────────────────────────────────────────────────────────────────────
+
+    static void Main(string[] args)
+    {
+        string inputPath  = args.Length > 0 ? args[0] : "input.mp4";
+        string outputPath = args.Length > 1 ? args[1] : "output_cropped.mp4";
+        string csvPath    = Path.ChangeExtension(outputPath, ".csv");
+
+        bool wantAlpha = outputPath.EndsWith(".webm", StringComparison.OrdinalIgnoreCase)
+                      || outputPath.EndsWith(".mov",  StringComparison.OrdinalIgnoreCase);
+
+        using var capture = new VideoCapture(inputPath);
+        if (!capture.IsOpened())
+            throw new Exception($"Cannot open video: {inputPath}");
+
+        int    srcW        = (int)capture.Get(VideoCaptureProperties.FrameWidth);
+        int    srcH        = (int)capture.Get(VideoCaptureProperties.FrameHeight);
+        double fps         =      capture.Get(VideoCaptureProperties.Fps);
+        int    totalFrames = (int)capture.Get(VideoCaptureProperties.FrameCount);
+
+        int cropW = (int)(srcW * CROP_FRACTION);
+        int cropH = (int)(srcH * CROP_FRACTION);
+        int cropX = 0;
+        int cropY = srcH - cropH;
+
+        Console.WriteLine($"Source      : {srcW}x{srcH}  @{fps:F2} fps  ({totalFrames} frames)");
+        Console.WriteLine($"Crop region : x={cropX} y={cropY}  →  {cropW}x{cropH}");
+        Console.WriteLine($"Alpha output: {wantAlpha}");
+        Console.WriteLine($"Video out   : {outputPath}");
+        Console.WriteLine($"CSV out     : {csvPath}");
+        Console.WriteLine();
+
+        FourCC fourcc = wantAlpha ? FourCC.FromString("png ") : FourCC.MP4V;
+        using var writer = new VideoWriter(outputPath, fourcc, fps, new Size(cropW, cropH), isColor: true);
+        if (!writer.IsOpened())
+            throw new Exception("Cannot open VideoWriter. Check codec/path.");
+
+        using var csvWriter = new StreamWriter(csvPath, append: false, encoding: Encoding.UTF8);
+        csvWriter.WriteLine("frame,timestamp_ms,cols_detected,row0,row1,row0_hex,row1_hex");
+
+        // Persistent Mats
+        using var srcFrame  = new Mat();
+        using var cropped   = new Mat();
+        using var hsv       = new Mat();
+        using var redMask1  = new Mat();
+        using var redMask2  = new Mat();
+        using var redMask   = new Mat();
+        using var processed = new Mat();
+
+        Rect? boxRect = null;
+
+        int frameIdx = 0;
+        while (capture.Read(srcFrame) && !srcFrame.Empty())
+        {
+            double timestampMs = frameIdx * 1000.0 / fps;
+
+            // ── 1. Crop ───────────────────────────────────────────────────────
+            new Mat(srcFrame, new Rect(cropX, cropY, cropW, cropH)).CopyTo(cropped);
+
+            // ── 2. Detect red box via HSV ─────────────────────────────────────
+            Cv2.CvtColor(cropped, hsv, ColorConversionCodes.BGR2HSV);
+            Cv2.InRange(hsv, RED_HSV_LO1, RED_HSV_HI1, redMask1);
+            Cv2.InRange(hsv, RED_HSV_LO2, RED_HSV_HI2, redMask2);
+            Cv2.BitwiseOr(redMask1, redMask2, redMask);
+
+            Cv2.FindContours(redMask, out Point[][] contours, out _,
+                RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+
+            Rect? bestRect = null;
+            double bestArea = MIN_BOX_AREA;
+            foreach (var contour in contours)
+            {
+                double area = Cv2.ContourArea(contour);
+                if (area > bestArea) { bestArea = area; bestRect = Cv2.BoundingRect(contour); }
+            }
+            if (bestRect.HasValue) boxRect = bestRect.Value;
+
+            // ── 3. Prepare output frame ───────────────────────────────────────
+            if (wantAlpha)
+                Cv2.CvtColor(cropped, processed, ColorConversionCodes.BGR2BGRA);
+            else
+                cropped.CopyTo(processed);
+
+            // ── 4. Process interior + extract bits ────────────────────────────
+            if (boxRect.HasValue)
+            {
+                var box   = boxRect.Value;
+                int inset = BORDER_THICKNESS + 1;
+                var interior = ClampRect(new Rect(
+                    box.X + inset, box.Y + inset,
+                    Math.Max(1, box.Width  - inset * 2),
+                    Math.Max(1, box.Height - inset * 2)),
+                    cropW, cropH);
+
+                if (interior.Width > 4 && interior.Height > 4)
+                {
+                    using var interiorCropped  = new Mat(cropped, interior);
+                    using var interiorGray     = new Mat();
+                    using var interiorDenoised = new Mat();
+                    using var interiorBinary   = new Mat();
+                    using var interiorDark     = new Mat();
+                    using var interiorLight    = new Mat();
+
+                    Cv2.CvtColor(interiorCropped, interiorGray, ColorConversionCodes.BGR2GRAY);
+
+                    if (DENOISE_SIZE > 1)
+                        Cv2.MedianBlur(interiorGray, interiorDenoised, DENOISE_SIZE);
+                    else
+                        interiorGray.CopyTo(interiorDenoised);
+
+                    Cv2.Threshold(interiorDenoised, interiorBinary, 0, 255,
+                        ThresholdTypes.Binary | ThresholdTypes.Otsu);
+
+                    Cv2.Threshold(interiorBinary, interiorDark,  127, 255, ThresholdTypes.BinaryInv);
+                    Cv2.Threshold(interiorBinary, interiorLight, 127, 255, ThresholdTypes.Binary);
+
+                    // Paint interior
+                    using var processedROI = new Mat(processed, interior);
+                    processedROI.SetTo(wantAlpha ? BLACK_BGRA : BLACK_BGR, interiorDark);
+                    processedROI.SetTo(wantAlpha ? WHITE_BGRA : WHITE_BGR, interiorLight);
+
+                    // ── Extract bits from the 2-row grid ─────────────────────
+                    int cols = NUM_COLS > 0
+                        ? NUM_COLS
+                        : DetectColumnCount(interiorBinary);
+
+                    if (cols > 0)
+                    {
+                        var (row0, row1) = ExtractBits(interiorBinary, cols);
+
+                        // Write CSV row
+                        string r0str   = string.Concat(row0);
+                        string r1str   = string.Concat(row1);
+                        string r0hex   = BitsToHex(row0);
+                        string r1hex   = BitsToHex(row1);
+                        csvWriter.WriteLine(
+                            $"{frameIdx},{timestampMs:F1},{cols},{r0str},{r1str},{r0hex},{r1hex}");
+
+                        // Console — only print when bits change (avoids spam)
+                        if (frameIdx == 0 || frameIdx % 30 == 0)
+                            Console.WriteLine(
+                                $"  [{frameIdx,5}] {timestampMs,8:F0}ms  cols={cols}" +
+                                $"  R0={r0str} ({r0hex})  R1={r1str} ({r1hex})");
+                    }
+                }
+
+                // Redraw border
+                Cv2.Rectangle(processed, box,
+                    wantAlpha ? RED_BGRA : RED_BGR, BORDER_THICKNESS);
+            }
+
+            writer.Write(processed);
+            frameIdx++;
+
+            if (frameIdx % 30 == 0 || frameIdx == totalFrames)
+            {
+                double pct = totalFrames > 0 ? frameIdx * 100.0 / totalFrames : 0;
+                Console.Write($"\r  Processing frame {frameIdx}/{totalFrames}  ({pct:F1}%)   ");
+            }
+        }
+
+        Console.WriteLine($"\n\nDone! {frameIdx} frames written.");
+        Console.WriteLine($"Bits saved to: {csvPath}");
+    }
+
+    // ── Auto-detect column count ──────────────────────────────────────────────
+    // Projects the binary image vertically (sum each column) and counts
+    // the number of distinct "white" runs = number of columns of squares.
+    // Works even when squares touch each other (no gap needed).
+    static int DetectColumnCount(Mat binary)
+    {
+        // Collapse to a single row: mean brightness per column
+        using var colSum = new Mat();
+        Cv2.Reduce(binary, colSum, ReduceDimension.Row, ReduceTypes.Avg, MatType.CV_32F);
+
+        int width = colSum.Cols;
+        float[] vals = new float[width];
+        colSum.GetArray(out vals);
+
+        // Find the overall mean to use as a split threshold
+        float mean = 0;
+        for (int i = 0; i < width; i++) mean += vals[i];
+        mean /= width;
+        float threshold = mean * 0.5f;   // anything above half the mean = "white column"
+
+        // Count transitions from below-threshold to above-threshold = one new square
+        int cols  = 0;
+        bool inWhite = false;
+        for (int i = 0; i < width; i++)
+        {
+            if (!inWhite && vals[i] > threshold) { cols++;  inWhite = true; }
+            else if (inWhite && vals[i] <= threshold) { inWhite = false; }
+        }
+
+        return cols;
+    }
+
+    // ── Extract bit values from a 2-row grid ─────────────────────────────────
+    // Divides the binary image into 2 rows × cols columns.
+    // Samples the centre SAMPLE_FRACTION of each cell and votes.
+    static (int[] row0, int[] row1) ExtractBits(Mat binary, int cols)
+    {
+        int w = binary.Cols;
+        int h = binary.Rows;
+
+        int rowH  = h / 2;
+        int colW  = w / cols;
+
+        var row0 = new int[cols];
+        var row1 = new int[cols];
+
+        for (int c = 0; c < cols; c++)
+        {
+            for (int r = 0; r < 2; r++)
+            {
+                // Cell bounding box
+                int cellX = c * colW;
+                int cellY = r * rowH;
+                int cellW = (c == cols - 1) ? w - cellX : colW;  // last col takes remainder
+                int cellH = (r == 1)        ? h - cellY : rowH;
+
+                // Inset to sample only the centre fraction
+                int padX = (int)(cellW * (1 - SAMPLE_FRACTION) / 2);
+                int padY = (int)(cellH * (1 - SAMPLE_FRACTION) / 2);
+                int sX   = Math.Max(cellX, cellX + padX);
+                int sY   = Math.Max(cellY, cellY + padY);
+                int sW   = Math.Max(1, cellW - padX * 2);
+                int sH   = Math.Max(1, cellH - padY * 2);
+
+                var sampleRect = ClampRect(new Rect(sX, sY, sW, sH), binary.Cols, binary.Rows);
+
+                using var cell = new Mat(binary, sampleRect);
+                double meanVal = Cv2.Mean(cell).Val0;  // 0=black, 255=white
+
+                int bit = (meanVal / 255.0) >= WHITE_VOTE_THRESHOLD ? 1 : 0;
+
+                if (r == 0) row0[c] = bit;
+                else        row1[c] = bit;
+            }
+        }
+
+        return (row0, row1);
+    }
+
+    // ── Convert 32-bit array to 8-char hex string ─────────────────────────────
+    static string BitsToHex(int[] bits)
+    {
+        // 32 bits → 8 nibbles → 8 hex chars, MSB first
+        var sb = new StringBuilder(8);
+        for (int i = 0; i < bits.Length; i += 4)
+        {
+            int nibble = 0;
+            for (int b = 0; b < 4 && (i + b) < bits.Length; b++)
+                if (bits[i + b] == 1)
+                    nibble |= (1 << (3 - b));
+            sb.Append(nibble.ToString("X"));
+        }
+        return sb.ToString();
+    }
+
+    // ── Clamp rect to frame bounds ────────────────────────────────────────────
+    static Rect ClampRect(Rect r, int maxW, int maxH)
+    {
+        int x = Math.Max(0, r.X);
+        int y = Math.Max(0, r.Y);
+        int w = Math.Min(r.Width,  maxW - x);
+        int h = Math.Min(r.Height, maxH - y);
+        return new Rect(x, y, Math.Max(0, w), Math.Max(0, h));
+    }
+}
