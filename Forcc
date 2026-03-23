@@ -1,0 +1,14 @@
+// Option 1 - Uncompressed YUV (most likely to work)
+int fourcc = VideoWriter.Fourcc('I', 'Y', 'U', 'V');
+
+// Option 2 - Huffyuv lossless
+int fourcc = VideoWriter.Fourcc('H', 'F', 'Y', 'U');
+
+// Option 3 - FFV1 lossless
+int fourcc = VideoWriter.Fourcc('F', 'F', 'V', '1');
+
+// Option 4 - PNG lossless
+int fourcc = VideoWriter.Fourcc('p', 'n', 'g', ' ');
+
+// Option 5 - Uncompressed DIB (Windows only)
+int fourcc = VideoWriter.Fourcc('D', 'I', 'B', ' ');
