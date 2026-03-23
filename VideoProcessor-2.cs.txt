@@ -1,0 +1,122 @@
+// VideoProcessor.cs
+// NuGet packages required:
+//   OpenCvSharp4
+//   OpenCvSharp4.runtime.win (Windows) OR OpenCvSharp4.runtime.ubuntu.20.04-x64 (Linux)
+//
+// dotnet add package OpenCvSharp4
+// dotnet add package OpenCvSharp4.runtime.win
+
+using OpenCvSharp;
+
+class VideoProcessor
+{
+    // ── Tunable constants ──────────────────────────────────────────────────────
+    private const double CROP_FRACTION = 0.20;  // bottom-left 20%
+
+    // Median blur kernel before thresholding — kills H.264 block noise.
+    // Must be odd. 0 or 1 = off, 3 = recommended, 5 = heavy denoise.
+    private const int DENOISE_SIZE = 3;
+
+    // Target colour: #FF000064  (R=255 G=0 B=0 A=100)
+    // MP4/AVI → alpha is dropped; use .mov for full RGBA output.
+    private static readonly Scalar RED_BGR  = new Scalar(0, 0, 255);        // OpenCV is BGR
+    private static readonly Scalar RED_BGRA = new Scalar(0, 0, 255, 100);   // A = 0x64 = 100
+    private static readonly Scalar WHITE    = new Scalar(255, 255, 255);
+
+    // ──────────────────────────────────────────────────────────────────────────
+
+    static void Main(string[] args)
+    {
+        string inputPath  = args.Length > 0 ? args[0] : "input.mp4";
+        string outputPath = args.Length > 1 ? args[1] : "output_cropped.mp4";
+
+        bool wantAlpha = outputPath.EndsWith(".webm", StringComparison.OrdinalIgnoreCase)
+                      || outputPath.EndsWith(".mov",  StringComparison.OrdinalIgnoreCase);
+
+        using var capture = new VideoCapture(inputPath);
+        if (!capture.IsOpened())
+            throw new Exception($"Cannot open video: {inputPath}");
+
+        int    srcW        = (int)capture.Get(VideoCaptureProperties.FrameWidth);
+        int    srcH        = (int)capture.Get(VideoCaptureProperties.FrameHeight);
+        double fps         =      capture.Get(VideoCaptureProperties.Fps);
+        int    totalFrames = (int)capture.Get(VideoCaptureProperties.FrameCount);
+
+        // ── Crop region: bottom-left 20% ──────────────────────────────────────
+        int cropW = (int)(srcW * CROP_FRACTION);
+        int cropH = (int)(srcH * CROP_FRACTION);
+        int cropX = 0;
+        int cropY = srcH - cropH;
+
+        Console.WriteLine($"Source      : {srcW}x{srcH}  @{fps:F2} fps  ({totalFrames} frames)");
+        Console.WriteLine($"Crop region : x={cropX} y={cropY}  →  {cropW}x{cropH}  (bottom-left 20%)");
+        Console.WriteLine($"Alpha output: {wantAlpha}");
+        Console.WriteLine($"Output      : {outputPath}");
+        Console.WriteLine();
+
+        FourCC fourcc = wantAlpha ? FourCC.FromString("png ") : FourCC.MP4V;
+
+        using var writer = new VideoWriter(outputPath, fourcc, fps, new Size(cropW, cropH), isColor: true);
+        if (!writer.IsOpened())
+            throw new Exception("Cannot open VideoWriter. Check codec/path.");
+
+        using var srcFrame  = new Mat();
+        using var cropped   = new Mat();
+        using var gray      = new Mat();
+        using var denoised  = new Mat();
+        using var binary    = new Mat();   // Otsu output: 0 = dark, 255 = light
+        using var darkMask  = new Mat();   // dark pixels  → replace with red
+        using var lightMask = new Mat();   // light pixels → replace with pure white
+        using var processed = new Mat();
+
+        int frameIdx = 0;
+        while (capture.Read(srcFrame) && !srcFrame.Empty())
+        {
+            // 1. Crop bottom-left 20%
+            new Mat(srcFrame, new Rect(cropX, cropY, cropW, cropH)).CopyTo(cropped);
+
+            // 2. Grayscale — collapses chroma compression artefacts into pure luminance
+            Cv2.CvtColor(cropped, gray, ColorConversionCodes.BGR2GRAY);
+
+            // 3. Median blur to remove H.264 block/ringing noise while keeping
+            //    hard square edges sharp (median preserves edges better than Gaussian)
+            if (DENOISE_SIZE > 1)
+                Cv2.MedianBlur(gray, denoised, DENOISE_SIZE);
+            else
+                gray.CopyTo(denoised);
+
+            // 4. Otsu's auto-threshold — computes the optimal split between the dark
+            //    and light pixel clusters automatically, so it adapts per-frame to
+            //    varying compression levels and lighting. No magic number needed.
+            //    Result: every pixel is either 0 (dark) or 255 (light) — no grays.
+            Cv2.Threshold(denoised, binary, 0, 255,
+                ThresholdTypes.Binary | ThresholdTypes.Otsu);
+
+            // 5. Derive the two masks from the binary image
+            Cv2.Threshold(binary, darkMask,  127, 255, ThresholdTypes.BinaryInv); // 0   → 255 mask
+            Cv2.Threshold(binary, lightMask, 127, 255, ThresholdTypes.Binary);    // 255 → 255 mask
+
+            // 6. Paint output:
+            //    dark  squares → #FF0000 (with alpha A=100 if .mov)
+            //    light squares → pure white (255, 255, 255)
+            if (wantAlpha)
+                Cv2.CvtColor(cropped, processed, ColorConversionCodes.BGR2BGRA);
+            else
+                cropped.CopyTo(processed);
+
+            processed.SetTo(wantAlpha ? RED_BGRA : RED_BGR, darkMask);
+            processed.SetTo(WHITE, lightMask);
+
+            writer.Write(processed);
+
+            frameIdx++;
+            if (frameIdx % 30 == 0 || frameIdx == totalFrames)
+            {
+                double pct = totalFrames > 0 ? frameIdx * 100.0 / totalFrames : 0;
+                Console.Write($"\r  Frame {frameIdx}/{totalFrames}  ({pct:F1}%)   ");
+            }
+        }
+
+        Console.WriteLine($"\nDone! {frameIdx} frames written → {outputPath}");
+    }
+}
