@@ -138,25 +138,30 @@ public class BinaryClockReader
     /// Minimum width-to-height ratio the detected box must have.
     /// Because the barcode has 32 columns and only 2 rows, the box is always
     /// much wider than it is tall. A ratio of 2.0 means width must be at least
-    /// 2× the height, which filters out squares and tall rectangles that are
-    /// not the barcode (e.g. individual bit-squares or UI chrome).
+    /// 2× the height, which filters out squares and tall rectangles.
     /// </summary>
     public double MinAspectRatio { get; set; } = 2.0;
 
     /// <summary>
-    /// Size of the morphological dilation kernel applied to the Canny edge
-    /// image before finding contours. Must be odd (1 = disabled).
-    ///
-    /// Why dilation helps:
-    ///   H.264 compression can break a continuous border line into small
-    ///   disconnected fragments. Dilation grows every white (edge) pixel
-    ///   outward, bridging those gaps so the four sides of the rectangle
-    ///   form one connected contour instead of many separate pieces.
-    ///
-    /// 3 = recommended for most compressed video.
-    /// Increase to 5 if the border is very faint or heavily compressed.
+    /// Maximum width-to-height ratio the detected box may have.
+    /// A 32-column × 2-row barcode has a ratio roughly between 8 and 20
+    /// depending on the square size. 25.0 is a generous upper bound that
+    /// rules out extremely wide thin lines while keeping real barcodes.
+    /// Lower this if wide non-barcode elements appear in the crop region.
     /// </summary>
-    public int EdgeDilationSize { get; set; } = 3;
+    public double MaxAspectRatio { get; set; } = 25.0;
+
+    /// <summary>
+    /// The aspect ratio you expect the barcode box to have.
+    /// Used to score candidates: the closer a contour's ratio is to this
+    /// value, the higher it scores — so the best-fitting rectangle wins
+    /// even if a larger but wrong-shaped contour also passes the filters.
+    ///
+    /// Default 8.0 assumes squares are about twice as wide as tall, giving
+    /// a 32-column × 2-row box a ratio of roughly 8:1.
+    /// Adjust if your squares have a very different aspect ratio.
+    /// </summary>
+    public double ExpectedAspectRatio { get; set; } = 8.0;
 
     // ══════════════════════════════════════════════════════════════════════════
     // COLOUR CONSTANTS
@@ -218,101 +223,98 @@ public class BinaryClockReader
     /// Scans the given frame for the barcode rectangle and returns its
     /// bounding rect. Returns null if nothing suitable is found.
     ///
-    /// Detection pipeline (all colour-agnostic — works for any border colour):
-    ///   1. Convert to grayscale
-    ///   2. Gaussian blur to suppress H.264 block noise before edge detection
+    /// Detection pipeline (colour-agnostic — works for any border colour):
+    ///   1. Grayscale conversion
+    ///   2. Gaussian blur to suppress H.264 block-noise before edge detection
     ///   3. Canny edge detection to find sharp brightness transitions
-    ///   4. Morphological dilation to bridge gaps in thin/fragmented borders
-    ///   5. Find contours and score each one against three filters:
-    ///        a) Minimum area  — skip tiny noise blobs
-    ///        b) ApproxPolyDP  — contour must simplify to exactly 4 corners
-    ///                           (a true rectangle, not a jagged blob)
-    ///        c) Aspect ratio  — box must be wider than tall (32 cols × 2 rows)
-    ///   6. Return the bounding rect of the highest-scoring candidate
+    ///   4. FindContours with External retrieval (outermost contours only —
+    ///      ignores anything nested inside the box, like the bit squares)
+    ///   5. Each contour is tested against three hard filters:
+    ///        a) Minimum area     — skip noise blobs
+    ///        b) ApproxPolyDP     — must simplify to exactly 4 corners
+    ///        c) Aspect ratio     — must fall between MinAspectRatio and
+    ///                              MaxAspectRatio (rules out squares, thin
+    ///                              lines, and anything too wide)
+    ///   6. Among candidates that pass all filters, the winner is chosen by
+    ///      SCORE rather than raw area. Score = area × aspect_similarity,
+    ///      where aspect_similarity is how close the contour's ratio is to
+    ///      ExpectedAspectRatio (1.0 = perfect match, 0 = very far off).
+    ///      This means a correctly-shaped smaller box beats a large but
+    ///      wrong-shaped contour.
     /// </summary>
     public Rect? DetectBarcodeRect(Mat frame)
     {
         using var gray    = new Mat();
         using var blurred = new Mat();
         using var edges   = new Mat();
-        using var dilated = new Mat();
 
-        // Step 1: Grayscale — collapses BGR to single luminance channel.
-        // Canny only operates on single-channel images.
+        // Step 1: Grayscale
         Cv2.CvtColor(frame, gray, ColorConversionCodes.BGR2GRAY);
 
-        // Step 2: Gaussian blur before Canny.
-        // A 5×5 kernel smooths out H.264 block artifacts (the blocky noise
-        // you get from video compression). Without this, Canny produces a
-        // blizzard of tiny fragmented edges from the compression blocks,
-        // making it hard to isolate the clean rectangle border.
-        // The "1.0" is the standard deviation — 0 means auto-calculate from kernel size.
-        Cv2.GaussianBlur(gray, blurred, new Size(5, 5), sigmaX: 1.0);
+        // Step 2: Gaussian blur (5×5) to kill H.264 block-noise before Canny.
+        // Without this, the compression grid produces hundreds of false edges.
+        // sigmaX: 0 = auto-derive standard deviation from the kernel size.
+        Cv2.GaussianBlur(gray, blurred, new Size(5, 5), sigmaX: 0);
 
-        // Step 3: Canny edge detection on the blurred grayscale.
+        // Step 3: Canny edge detection
         Cv2.Canny(blurred, edges, CannyLo, CannyHi);
 
-        // Step 4: Morphological dilation — grow every edge pixel outward.
-        // If EdgeDilationSize is 3, each edge pixel expands into a 3×3 square.
-        // This bridges small gaps where compression broke the border line,
-        // turning disconnected fragments back into one closed rectangle outline.
-        if (EdgeDilationSize > 1)
-        {
-            // GetStructuringElement creates the kernel shape for morphological ops.
-            // Rect = square kernel (all cells active), which is best for closing
-            // gaps in straight lines.
-            using var kernel = Cv2.GetStructuringElement(
-                MorphShapes.Rect,
-                new Size(EdgeDilationSize, EdgeDilationSize));
-            Cv2.Dilate(edges, dilated, kernel);
-        }
-        else
-        {
-            edges.CopyTo(dilated); // dilation disabled — use raw edges as-is
-        }
+        // Step 4: Find contours.
+        // RetrievalModes.External returns only the outermost contours.
+        // This is crucial — it means the squares INSIDE the barcode box are
+        // never returned because they are nested inside the outer rectangle's
+        // contour. We only ever see the box outline itself.
+        // (Previously we used List + dilation, which caused adjacent contours
+        // from outside the crop region to merge with the box border and inflate
+        // the detected rectangle. External + no dilation avoids that entirely.)
+        Cv2.FindContours(edges, out Point[][] contours, out _,
+            RetrievalModes.External, ContourApproximationModes.ApproxSimple);
 
-        // Step 5: Find contours in the dilated edge image.
-        // RetrievalModes.List returns ALL contours (not just outermost).
-        // We use List instead of External here because after dilation the outer
-        // rectangle border and the inner square edges may merge into one contour
-        // hierarchy — List gives us everything and we filter manually below.
-        Cv2.FindContours(dilated, out Point[][] contours, out _,
-            RetrievalModes.List, ContourApproximationModes.ApproxSimple);
-
-        Rect?  best     = null;
-        double bestArea = MinBoxArea;
+        Rect?  best      = null;
+        double bestScore = 0; // score of the current winning candidate
 
         foreach (var contour in contours)
         {
-            // Filter a: minimum area check
+            // Filter a: skip contours too small to be the barcode box
             double area = Cv2.ContourArea(contour);
-            if (area < bestArea) continue;
+            if (area < MinBoxArea) continue;
 
-            // Filter b: ApproxPolyDP — simplify the contour to its dominant corners.
-            // epsilon controls how aggressively to simplify: larger = fewer corners.
-            // 0.04 × perimeter is a well-known heuristic for finding rectangles.
-            // A true rectangle simplifies to exactly 4 points.
-            // A jagged contour or the interior squares keep many more points.
+            // Filter b: ApproxPolyDP — reduce the contour to its dominant corners.
+            // epsilon = 2% of the perimeter. This is tighter than the previous 4%,
+            // which was over-aggressively merging adjacent corners and allowing
+            // non-rectangular shapes to simplify down to 4 points.
+            // 2% still smooths away compression noise on the edges while demanding
+            // the shape is genuinely close to a rectangle.
             double perimeter = Cv2.ArcLength(contour, closed: true);
-            var    approx    = Cv2.ApproxPolyDP(contour, epsilon: 0.04 * perimeter, closed: true);
+            var    approx    = Cv2.ApproxPolyDP(contour, epsilon: 0.02 * perimeter, closed: true);
 
-            // Must have exactly 4 corners to be considered a rectangle.
-            // Interior squares will also pass this — the aspect ratio filter (next)
-            // handles them.
+            // Exactly 4 corners = rectangle (or close enough to one)
             if (approx.Length != 4) continue;
 
-            // Filter c: aspect ratio — the barcode box must be significantly wider
-            // than tall because it holds 32 columns of squares across only 2 rows.
-            // Individual interior squares are roughly 1:1 (equal width and height)
-            // and get rejected here.
-            Rect   br          = Cv2.BoundingRect(approx);
-            double aspectRatio = br.Width / (double)br.Height;
-            if (aspectRatio < MinAspectRatio) continue;
+            // Filter c: aspect ratio window.
+            // Both a minimum AND maximum bound prevent the detector from latching
+            // onto wide letterbox bars, thin horizontal lines from subtitles, or
+            // any other wide elements that happen to have 4 corners.
+            Rect   br    = Cv2.BoundingRect(approx);
+            double ratio = br.Width / (double)br.Height;
+            if (ratio < MinAspectRatio || ratio > MaxAspectRatio) continue;
 
-            // This candidate passed all three filters and is larger than the
-            // current best — promote it to best.
-            bestArea = area;
-            best     = br;
+            // Step 6: Score by aspect ratio similarity.
+            // We divide the smaller of (ratio, expected) by the larger —
+            // this produces 1.0 when they match exactly and approaches 0
+            // as they diverge. Multiplying by area means a well-shaped
+            // large box outranks a well-shaped tiny one, but a wrong-shaped
+            // large box (e.g. a wide subtitle bar) can still lose to a
+            // correctly-shaped smaller barcode box.
+            double similarity = Math.Min(ratio, ExpectedAspectRatio)
+                              / Math.Max(ratio, ExpectedAspectRatio);
+            double score = area * similarity;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best      = br;
+            }
         }
 
         return best;
