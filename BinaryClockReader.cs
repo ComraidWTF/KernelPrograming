@@ -117,41 +117,61 @@ public class BinaryClockReader
     public double WhiteVoteThreshold { get; set; } = 0.5;
 
     /// <summary>
-    /// Any contour smaller than this area (in pixels²) is ignored during
-    /// the fallback contour check. Not used in the primary Sobel projection path.
+    /// Minimum contour area in pixels² to be considered as the barcode box.
+    /// Increase if small coloured UI elements are being mistaken for the box.
     /// </summary>
     public double MinBoxArea { get; set; } = 500;
 
     /// <summary>
     /// Minimum width-to-height ratio the detected box must satisfy.
-    /// With 32 columns and 2 rows, the box is always significantly wider than tall.
-    /// 2.0 rules out individual squares and tall rectangles.
+    /// With 32 columns and 2 rows the box is always wider than tall.
+    /// 2.0 rules out individual bit-squares and tall rectangles.
     /// </summary>
     public double MinAspectRatio { get; set; } = 2.0;
 
     /// <summary>
-    /// Maximum width-to-height ratio. 25.0 rules out extremely wide thin lines
-    /// (e.g. letterbox bars, subtitle strips) while keeping real barcode boxes.
+    /// Maximum width-to-height ratio. 30.0 rules out very thin horizontal lines
+    /// (subtitle bars etc.) while keeping any realistic barcode box.
     /// </summary>
-    public double MaxAspectRatio { get; set; } = 25.0;
+    public double MaxAspectRatio { get; set; } = 30.0;
 
     /// <summary>
-    /// How many of the strongest gradient peaks to consider when locating each
-    /// border line (top, bottom, left, right). The algorithm picks the pair of
-    /// peaks from these candidates that best satisfies the aspect ratio constraints.
+    /// Minimum HSV saturation (0–255) a pixel must have to be treated as part
+    /// of the coloured border. Pixels below this are considered black, white,
+    /// or gray and are excluded from the border mask.
     ///
-    /// 5 is enough for clean video. Raise to 8–10 if the crop has several strong
-    /// horizontal or vertical structures competing with the barcode border.
+    /// Why saturation instead of a specific hue:
+    ///   A pure-red border has S≈255; a dark-brown border (#502e1a) has S≈171.
+    ///   Both are well above 40. Meanwhile black squares have S≈0, white squares
+    ///   have S≈0, and typical dark-gray video backgrounds have S &lt; 30.
+    ///   So thresholding on saturation catches ANY coloured border regardless
+    ///   of its hue, and rejects everything else automatically.
+    ///
+    /// Lower this (e.g. 25) if the border colour is very desaturated.
+    /// Raise it (e.g. 60) if coloured noise in the background causes false hits.
     /// </summary>
-    public int PeakCandidates { get; set; } = 5;
+    public int MinSaturation { get; set; } = 40;
 
     /// <summary>
-    /// Minimum distance in pixels between two peaks in the gradient projection.
-    /// Prevents the top and bottom border lines from being detected as the same peak.
-    /// Default is 10% of the crop dimension — increase if borders are very close together.
-    /// 0 = auto (10% of the relevant dimension).
+    /// Minimum HSV value (brightness, 0–255) a pixel must have to be part of
+    /// the border mask. Filters out near-black pixels that might have accidental
+    /// saturation values due to compression noise.
     /// </summary>
-    public int MinPeakSeparation { get; set; } = 0;
+    public int MinBorderValue { get; set; } = 20;
+
+    /// <summary>
+    /// Size of the morphological closing kernel applied to the colour mask
+    /// before contour detection. Must be odd. Default 7.
+    ///
+    /// Morphological closing = dilation followed by erosion. It fills small gaps
+    /// and holes in the mask caused by H.264 compression artefacts on the border
+    /// pixels, reconnecting broken border segments into one solid outline.
+    ///
+    /// Increase (e.g. 11) if the border is very faint or the video is heavily
+    /// compressed. Decrease (e.g. 3) if nearby coloured objects are merging
+    /// with the border mask.
+    /// </summary>
+    public int MorphCloseSize { get; set; } = 7;
 
     // ══════════════════════════════════════════════════════════════════════════
     // COLOUR CONSTANTS
@@ -210,144 +230,96 @@ public class BinaryClockReader
         => ProcessVideo(inputPath, outputPath, csvPath, boxColor);
 
     /// <summary>
-    /// Locates the barcode rectangle using Sobel gradient projections.
+    /// Locates the barcode rectangle using HSV saturation masking.
     ///
-    /// WHY THIS WORKS BETTER THAN EDGE/CONTOUR DETECTION:
-    ///   Previous approaches tried to trace the border as a contour. This fails
-    ///   when H.264 compression fragments the border into disconnected pieces —
-    ///   no single contour ever covers the full rectangle.
+    /// WHY SATURATION MASKING INSTEAD OF A SPECIFIC COLOUR OR EDGE DETECTION:
     ///
-    ///   Sobel projections instead ACCUMULATE evidence. The horizontal Sobel
-    ///   filter computes the vertical rate of brightness change at every pixel.
-    ///   When we sum that across each row, the top and bottom border lines
-    ///   produce the two highest spikes in the resulting array — because the
-    ///   border is a sudden brightness jump spanning the entire width of the box.
-    ///   Even if compression breaks the border into 20 small pieces, all 20
-    ///   pieces add their vote to the same row in the projection, and that row
-    ///   wins. The same logic applies column-wise for the left and right borders.
+    ///   Colour-specific (HSV red range): works for red but misses brown, orange, etc.
     ///
-    ///   Crucially, this is entirely COLOUR-AGNOSTIC. The Sobel filter responds
-    ///   to brightness CHANGE, not to any specific colour value. A dark-brown
-    ///   border (#502e1a) produces just as strong a gradient as a red one (#FF0000).
+    ///   Edge/contour detection: fragile because H.264 compression fragments the
+    ///   border into disconnected pieces. No single contour covers the full rectangle.
+    ///
+    ///   Saturation masking: instead of asking "is this pixel red?", we ask
+    ///   "is this pixel coloured at all?". Any pixel with sufficient HSV saturation
+    ///   passes. This means:
+    ///     • Red border  (#FF0000) → S≈255 ✓
+    ///     • Brown border (#502e1a) → S≈171 ✓
+    ///     • Orange, green, blue borders → all S >> 40 ✓
+    ///     • Black bit-squares → S≈0 ✗ (excluded)
+    ///     • White bit-squares → S≈0 ✗ (excluded)
+    ///     • Dark-gray video background → S &lt; 30 ✗ (excluded)
+    ///   The border is the only thing in the crop that is both coloured and rectangular.
     ///
     /// PIPELINE:
-    ///   1. Grayscale + Gaussian blur (suppress H.264 block-noise)
-    ///   2. SobelY (detects horizontal edges) → sum each row → row projection
-    ///      The two highest peaks = top and bottom border lines
-    ///   3. SobelX (detects vertical edges)  → sum each col → col projection
-    ///      The two highest peaks = left and right border lines
-    ///   4. Combine into a Rect and validate aspect ratio
+    ///   1. Convert to HSV
+    ///   2. Threshold on saturation + minimum brightness → colour mask
+    ///      (isolates the border pixels regardless of their specific hue)
+    ///   3. Morphological close → fills gaps that compression broke in the border
+    ///   4. Find external contours → only the outermost outlines
+    ///   5. Filter by aspect ratio, pick the largest valid candidate
     /// </summary>
     public Rect? DetectBarcodeRect(Mat frame)
     {
-        using var gray    = new Mat();
-        using var blurred = new Mat();
-        using var sobelX  = new Mat(); // vertical edges   (responds to left/right borders)
-        using var sobelY  = new Mat(); // horizontal edges (responds to top/bottom borders)
-        using var absX    = new Mat();
-        using var absY    = new Mat();
+        using var hsv      = new Mat();
+        using var satMask  = new Mat(); // pixels that are "coloured enough"
+        using var closed   = new Mat(); // mask after morphological close
+        using var kernel   = Cv2.GetStructuringElement(
+                                 MorphShapes.Rect,
+                                 new Size(MorphCloseSize, MorphCloseSize));
 
-        // Step 1: Grayscale — Sobel only works on single-channel images
-        Cv2.CvtColor(frame, gray, ColorConversionCodes.BGR2GRAY);
+        // Step 1: Convert BGR → HSV
+        // HSV separates colour (Hue + Saturation) from brightness (Value).
+        // This makes it easy to say "find anything coloured" without knowing
+        // what colour it is. In OpenCV, H is 0–180, S and V are 0–255.
+        Cv2.CvtColor(frame, hsv, ColorConversionCodes.BGR2HSV);
 
-        // Gaussian blur before Sobel to suppress H.264 block-artifact noise.
-        // A 5×5 kernel averages each pixel with its neighbourhood, which smooths
-        // the tiny brightness jumps between compression blocks while leaving the
-        // much larger jump at the actual border intact.
-        Cv2.GaussianBlur(gray, blurred, new Size(5, 5), sigmaX: 0);
-
-        // Step 2: Sobel filter
+        // Step 2: Saturation + brightness threshold
+        // InRange(src, lowerBound, upperBound, dst) sets dst[i]=255 where
+        // lowerBound ≤ src[i] ≤ upperBound on every channel, 0 otherwise.
         //
-        // Sobel computes the image gradient — how fast brightness changes.
-        // SobelX (dx=1, dy=0): measures horizontal rate of change → high at
-        //   vertical edges like the LEFT and RIGHT border lines.
-        // SobelY (dx=0, dy=1): measures vertical rate of change → high at
-        //   horizontal edges like the TOP and BOTTOM border lines.
-        //
-        // CV_32F = store result as 32-bit float so we don't lose negative values
-        //   (Sobel output can be negative when brightness decreases left-to-right).
-        // ksize=3 = 3×3 Sobel kernel, standard choice for this scale.
-        Cv2.Sobel(blurred, sobelX, MatType.CV_32F, dx: 1, dy: 0, ksize: 3);
-        Cv2.Sobel(blurred, sobelY, MatType.CV_32F, dx: 0, dy: 1, ksize: 3);
+        // We accept any hue (H: 0–180 = full range), require saturation above
+        // MinSaturation so black/white/gray pixels are excluded, and require
+        // brightness above MinBorderValue so near-black noise is excluded.
+        Cv2.InRange(hsv,
+            lowerb: new Scalar(0,              MinSaturation, MinBorderValue),
+            upperb: new Scalar(180,            255,           255),
+            dst:    satMask);
 
-        // ConvertScaleAbs takes the absolute value and converts back to 8-bit.
-        // We want magnitude (how strong the edge is) not direction, so we
-        // discard the sign.
-        Cv2.ConvertScaleAbs(sobelX, absX);
-        Cv2.ConvertScaleAbs(sobelY, absY);
+        // Step 3: Morphological close
+        // MorphTypes.Close = Dilate then Erode.
+        // Dilation grows every white pixel outward by (MorphCloseSize/2) pixels,
+        // bridging gaps between fragments of the border.
+        // Erosion then shrinks back to roughly the original size, but the gaps
+        // that were filled stay filled — they become connected.
+        // Net effect: small holes and breaks in the border outline are healed.
+        Cv2.MorphologyEx(satMask, closed, MorphTypes.Close, kernel);
 
-        // Step 3: Projections
-        //
-        // Reduce collapses the matrix along one dimension by summing:
-        //
-        //   ReduceDimension.Column (dim=1): collapses all COLUMNS for each row
-        //     → result is (height × 1): one sum per row
-        //     We do this on absY (horizontal edges) to find the rows with the
-        //     most horizontal-edge energy = the top and bottom border lines.
-        //
-        //   ReduceDimension.Row (dim=0): collapses all ROWS for each column
-        //     → result is (1 × width): one sum per column
-        //     We do this on absX (vertical edges) to find the columns with the
-        //     most vertical-edge energy = the left and right border lines.
-        using var rowProj = new Mat(); // height × 1  (horizontal edge energy per row)
-        using var colProj = new Mat(); // 1 × width   (vertical edge energy per column)
+        // Step 4: Find contours in the closed mask.
+        // RetrievalModes.External: only the outermost outlines — the interior
+        // bit-squares are nested inside the box and are automatically ignored.
+        Cv2.FindContours(closed, out Point[][] contours, out _,
+            RetrievalModes.External, ContourApproximationModes.ApproxSimple);
 
-        Cv2.Reduce(absY, rowProj, ReduceDimension.Column, ReduceTypes.Sum, MatType.CV_32F);
-        Cv2.Reduce(absX, colProj, ReduceDimension.Row,    ReduceTypes.Sum, MatType.CV_32F);
-
-        // GetArray copies the Mat data into a plain C# array for easy processing
-        rowProj.GetArray(out float[] rowVals); // index = row Y coordinate
-        colProj.GetArray(out float[] colVals); // index = column X coordinate
-
-        // Step 4: Find the top and bottom border lines as the two highest
-        // peaks in rowVals, and the left/right borders as the two highest
-        // peaks in colVals.
-        int rowSep = MinPeakSeparation > 0 ? MinPeakSeparation : Math.Max(5, frame.Rows / 10);
-        int colSep = MinPeakSeparation > 0 ? MinPeakSeparation : Math.Max(5, frame.Cols / 10);
-
-        int[] rowPeaks = FindTopPeaks(rowVals, PeakCandidates, rowSep);
-        int[] colPeaks = FindTopPeaks(colVals, PeakCandidates, colSep);
-
-        // We need at least 2 peaks in each dimension to form a rectangle
-        if (rowPeaks.Length < 2 || colPeaks.Length < 2) return null;
-
-        // Step 5: Among the top peaks, find the pair (topY, bottomY) and
-        // (leftX, rightX) whose resulting rectangle best satisfies the
-        // aspect ratio constraints.
-        //
-        // We try every combination of row-peak pairs and col-peak pairs
-        // and pick the one whose aspect ratio is closest to being within
-        // [MinAspectRatio, MaxAspectRatio] AND has the largest area.
+        // Step 5: Filter candidates by area and aspect ratio; pick the largest
         Rect?  best      = null;
-        double bestScore = 0;
+        double bestArea  = MinBoxArea; // doubles as the "minimum area to qualify" gate
 
-        for (int r1 = 0; r1 < rowPeaks.Length; r1++)
-        for (int r2 = r1 + 1; r2 < rowPeaks.Length; r2++)
-        for (int c1 = 0; c1 < colPeaks.Length; c1++)
-        for (int c2 = c1 + 1; c2 < colPeaks.Length; c2++)
+        foreach (var contour in contours)
         {
-            int topY   = Math.Min(rowPeaks[r1], rowPeaks[r2]);
-            int bottomY = Math.Max(rowPeaks[r1], rowPeaks[r2]);
-            int leftX  = Math.Min(colPeaks[c1], colPeaks[c2]);
-            int rightX = Math.Max(colPeaks[c1], colPeaks[c2]);
+            double area = Cv2.ContourArea(contour);
+            if (area < bestArea) continue; // too small — noise, text, UI decoration
 
-            int w = rightX - leftX;
-            int h = bottomY - topY;
-            if (w <= 0 || h <= 0) continue;
+            Rect   br    = Cv2.BoundingRect(contour);
+            double ratio = br.Width / (double)br.Height;
 
-            double ratio = w / (double)h;
+            // The barcode is always wider than tall (32 cols × 2 rows).
+            // This single filter eliminates individual bit-squares (ratio ≈ 1)
+            // and tall thin objects (ratio < MinAspectRatio), while MaxAspectRatio
+            // rules out wide letterbox bars and subtitle lines.
             if (ratio < MinAspectRatio || ratio > MaxAspectRatio) continue;
 
-            // Score = area of the candidate rect.
-            // All candidates here already satisfy the aspect ratio constraint,
-            // so the largest valid rect wins — that's the barcode box, not a
-            // small rectangle formed by interior square edges.
-            double score = w * h;
-            if (score > bestScore)
-            {
-                bestScore = score;
-                best      = new Rect(leftX, topY, w, h);
-            }
+            bestArea = area; // new winner — update threshold so next must be larger
+            best     = br;
         }
 
         return best;
@@ -865,52 +837,6 @@ public class BinaryClockReader
         }
 
         return sb.ToString();
-    }
-
-    /// <summary>
-    /// Returns the indices of the top N strongest peaks in a float array,
-    /// enforcing that no two returned peaks are within minSeparation of each other.
-    ///
-    /// Algorithm (greedy suppression):
-    ///   1. Find the global maximum → that's peak 1
-    ///   2. Suppress all indices within minSeparation of peak 1
-    ///   3. Find the next maximum from the remaining indices → peak 2
-    ///   4. Repeat until we have N peaks or no candidates remain
-    ///
-    /// Returned indices are sorted in ascending order (smallest index first),
-    /// which means top-to-bottom for row projections and left-to-right for
-    /// column projections — exactly what we need when building the rect.
-    /// </summary>
-    private static int[] FindTopPeaks(float[] values, int n, int minSeparation)
-    {
-        int    len        = values.Length;
-        bool[] suppressed = new bool[len];
-        var    peaks      = new List<int>(n);
-
-        for (int p = 0; p < n; p++)
-        {
-            // Find the highest non-suppressed index
-            int best = -1;
-            for (int i = 0; i < len; i++)
-            {
-                if (suppressed[i]) continue;
-                if (best == -1 || values[i] > values[best])
-                    best = i;
-            }
-
-            if (best == -1) break; // no more candidates
-
-            peaks.Add(best);
-
-            // Suppress the neighbourhood around this peak so the next iteration
-            // can't pick a neighbouring point on the same border line
-            int lo = Math.Max(0,       best - minSeparation);
-            int hi = Math.Min(len - 1, best + minSeparation);
-            for (int i = lo; i <= hi; i++) suppressed[i] = true;
-        }
-
-        peaks.Sort(); // ascending: top before bottom, left before right
-        return peaks.ToArray();
     }
 
     /// <summary>
