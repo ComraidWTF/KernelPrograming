@@ -44,11 +44,19 @@ class Program
 
         var reader = new BinaryClockReader();
 
-        // Process the video AND write the bit values to a CSV alongside it
+        // ── Pick one of the four overloads ────────────────────────────────────
+
+        // 1. Video only, default red box (#FF000064)
+        // reader.CropVideo(input, output);
+
+        // 2. Video + CSV, default red box  ← active
         reader.CropVideo(input, output, csv);
 
-        // If you only want the video without the CSV, use this overload instead:
-        // reader.CropVideo(input, output);
+        // 3. Video only, custom box colour
+        // reader.CropVideo(input, output, HighlightColor.FromHex("#00FF00FF")); // solid green
+
+        // 4. Video + CSV, custom box colour
+        // reader.CropVideo(input, output, csv, HighlightColor.FromHex("#FF000064"));
     }
 }
 
@@ -127,13 +135,28 @@ public class BinaryClockReader
     public double CannyHi { get; set; } = 90;
 
     /// <summary>
-    /// Filters out non-rectangular contours. Calculated as:
-    ///   solidity = contour filled area / bounding rectangle area
-    /// A perfect rectangle scores 1.0. Jagged or curved shapes score lower.
-    /// 0.85 accepts mild distortion from video compression on the box edges.
-    /// Raise towards 1.0 for cleaner sources; lower for very noisy video.
+    /// Minimum width-to-height ratio the detected box must have.
+    /// Because the barcode has 32 columns and only 2 rows, the box is always
+    /// much wider than it is tall. A ratio of 2.0 means width must be at least
+    /// 2× the height, which filters out squares and tall rectangles that are
+    /// not the barcode (e.g. individual bit-squares or UI chrome).
     /// </summary>
-    public double RectSolidity { get; set; } = 0.85;
+    public double MinAspectRatio { get; set; } = 2.0;
+
+    /// <summary>
+    /// Size of the morphological dilation kernel applied to the Canny edge
+    /// image before finding contours. Must be odd (1 = disabled).
+    ///
+    /// Why dilation helps:
+    ///   H.264 compression can break a continuous border line into small
+    ///   disconnected fragments. Dilation grows every white (edge) pixel
+    ///   outward, bridging those gaps so the four sides of the rectangle
+    ///   form one connected contour instead of many separate pieces.
+    ///
+    /// 3 = recommended for most compressed video.
+    /// Increase to 5 if the border is very faint or heavily compressed.
+    /// </summary>
+    public int EdgeDilationSize { get; set; } = 3;
 
     // ══════════════════════════════════════════════════════════════════════════
     // COLOUR CONSTANTS
@@ -166,7 +189,7 @@ public class BinaryClockReader
     /// No CSV is written by this overload.
     /// </summary>
     public void CropVideo(string inputPath, string outputPath)
-        => ProcessVideo(inputPath, outputPath, csvPath: null);
+        => ProcessVideo(inputPath, outputPath, csvPath: null, boxColor: HighlightColor.Default);
 
     /// <summary>
     /// Same as CropVideo(input, output) but also writes a CSV file that
@@ -174,83 +197,124 @@ public class BinaryClockReader
     /// The CSV columns are: frame, timestamp_ms, row0, row1, row0_hex, row1_hex
     /// </summary>
     public void CropVideo(string inputPath, string outputPath, string csvPath)
-        => ProcessVideo(inputPath, outputPath, csvPath);
+        => ProcessVideo(inputPath, outputPath, csvPath, boxColor: HighlightColor.Default);
 
     /// <summary>
-    /// Scans the given frame for the largest rectangular contour and returns
-    /// its bounding rectangle. Returns null if nothing suitable is found.
+    /// Same as CropVideo(input, output) but draws the detected barcode box
+    /// border using the given highlight colour instead of the default red.
+    /// Example: reader.CropVideo("in.mp4", "out.mp4", HighlightColor.FromHex("#00FF00FF"))
+    /// </summary>
+    public void CropVideo(string inputPath, string outputPath, HighlightColor boxColor)
+        => ProcessVideo(inputPath, outputPath, csvPath: null, boxColor);
+
+    /// <summary>
+    /// Combines CSV output and a custom box highlight colour.
+    /// The detected box border is drawn with boxColor on every frame.
+    /// </summary>
+    public void CropVideo(string inputPath, string outputPath, string csvPath, HighlightColor boxColor)
+        => ProcessVideo(inputPath, outputPath, csvPath, boxColor);
+
+    /// <summary>
+    /// Scans the given frame for the barcode rectangle and returns its
+    /// bounding rect. Returns null if nothing suitable is found.
     ///
-    /// This method is COLOUR-AGNOSTIC — it looks for edges (sharp transitions
-    /// between light and dark pixels), not for a specific colour. This means
-    /// it keeps working even when the border colour shifts due to HDR
-    /// tone-mapping or video encoding changes (e.g. red → dark brown).
+    /// Detection pipeline (all colour-agnostic — works for any border colour):
+    ///   1. Convert to grayscale
+    ///   2. Gaussian blur to suppress H.264 block noise before edge detection
+    ///   3. Canny edge detection to find sharp brightness transitions
+    ///   4. Morphological dilation to bridge gaps in thin/fragmented borders
+    ///   5. Find contours and score each one against three filters:
+    ///        a) Minimum area  — skip tiny noise blobs
+    ///        b) ApproxPolyDP  — contour must simplify to exactly 4 corners
+    ///                           (a true rectangle, not a jagged blob)
+    ///        c) Aspect ratio  — box must be wider than tall (32 cols × 2 rows)
+    ///   6. Return the bounding rect of the highest-scoring candidate
     /// </summary>
     public Rect? DetectBarcodeRect(Mat frame)
     {
-        // We work on a grayscale copy because Canny only accepts single-channel images.
-        // Grayscale collapses R, G, B into one luminance value per pixel.
-        using var gray  = new Mat();
-        using var edges = new Mat();
+        using var gray    = new Mat();
+        using var blurred = new Mat();
+        using var edges   = new Mat();
+        using var dilated = new Mat();
 
-        // ColorConversionCodes.BGR2GRAY uses the standard luminance formula:
-        //   Y = 0.114*B + 0.587*G + 0.299*R
-        // This weights green most heavily because human eyes are most sensitive to it.
+        // Step 1: Grayscale — collapses BGR to single luminance channel.
+        // Canny only operates on single-channel images.
         Cv2.CvtColor(frame, gray, ColorConversionCodes.BGR2GRAY);
 
-        // Canny edge detection — finds pixels where brightness changes sharply.
-        // Internally it:
-        //   1. Blurs slightly to reduce noise
-        //   2. Computes the brightness gradient (rate of change) at every pixel
-        //   3. Keeps only local maxima of that gradient (thin lines)
-        //   4. Applies hysteresis with CannyLo/CannyHi thresholds
-        Cv2.Canny(gray, edges, CannyLo, CannyHi);
+        // Step 2: Gaussian blur before Canny.
+        // A 5×5 kernel smooths out H.264 block artifacts (the blocky noise
+        // you get from video compression). Without this, Canny produces a
+        // blizzard of tiny fragmented edges from the compression blocks,
+        // making it hard to isolate the clean rectangle border.
+        // The "1.0" is the standard deviation — 0 means auto-calculate from kernel size.
+        Cv2.GaussianBlur(gray, blurred, new Size(5, 5), sigmaX: 1.0);
 
-        // FindContours traces connected white pixels in the edge image into
-        // a list of point sequences (contours), each describing one shape outline.
-        //
-        // RetrievalModes.External — only return the outermost contours;
-        //   ignore any contours nested inside others. We only want the box border,
-        //   not the individual squares inside it.
-        //
-        // ContourApproximationModes.ApproxSimple — compress straight-line
-        //   segments to just their endpoints. A rectangle becomes 4 points
-        //   instead of hundreds, saving memory.
-        //
-        // "out _" discards the hierarchy output (parent/child relationships
-        //   between contours) because we don't need it.
-        Cv2.FindContours(edges, out Point[][] contours, out _,
-            RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        // Step 3: Canny edge detection on the blurred grayscale.
+        Cv2.Canny(blurred, edges, CannyLo, CannyHi);
 
-        Rect?  best     = null;  // will hold the best candidate rect we find
-        double bestArea = MinBoxArea; // current winner's area (starts at min threshold)
+        // Step 4: Morphological dilation — grow every edge pixel outward.
+        // If EdgeDilationSize is 3, each edge pixel expands into a 3×3 square.
+        // This bridges small gaps where compression broke the border line,
+        // turning disconnected fragments back into one closed rectangle outline.
+        if (EdgeDilationSize > 1)
+        {
+            // GetStructuringElement creates the kernel shape for morphological ops.
+            // Rect = square kernel (all cells active), which is best for closing
+            // gaps in straight lines.
+            using var kernel = Cv2.GetStructuringElement(
+                MorphShapes.Rect,
+                new Size(EdgeDilationSize, EdgeDilationSize));
+            Cv2.Dilate(edges, dilated, kernel);
+        }
+        else
+        {
+            edges.CopyTo(dilated); // dilation disabled — use raw edges as-is
+        }
+
+        // Step 5: Find contours in the dilated edge image.
+        // RetrievalModes.List returns ALL contours (not just outermost).
+        // We use List instead of External here because after dilation the outer
+        // rectangle border and the inner square edges may merge into one contour
+        // hierarchy — List gives us everything and we filter manually below.
+        Cv2.FindContours(dilated, out Point[][] contours, out _,
+            RetrievalModes.List, ContourApproximationModes.ApproxSimple);
+
+        Rect?  best     = null;
+        double bestArea = MinBoxArea;
 
         foreach (var contour in contours)
         {
-            // ContourArea calculates the filled area of the shape in pixels².
-            // We use it to skip tiny blobs (noise, text, UI elements).
+            // Filter a: minimum area check
             double area = Cv2.ContourArea(contour);
-            if (area < bestArea) continue; // too small — skip
+            if (area < bestArea) continue;
 
-            // BoundingRect returns the smallest axis-aligned rectangle that
-            // completely contains the contour points.
-            Rect br = Cv2.BoundingRect(contour);
+            // Filter b: ApproxPolyDP — simplify the contour to its dominant corners.
+            // epsilon controls how aggressively to simplify: larger = fewer corners.
+            // 0.04 × perimeter is a well-known heuristic for finding rectangles.
+            // A true rectangle simplifies to exactly 4 points.
+            // A jagged contour or the interior squares keep many more points.
+            double perimeter = Cv2.ArcLength(contour, closed: true);
+            var    approx    = Cv2.ApproxPolyDP(contour, epsilon: 0.04 * perimeter, closed: true);
 
-            // Solidity check: a true rectangle's contour fills almost all of
-            // its bounding box. A jagged or curved shape leaves a lot of empty
-            // space in the corners, giving a low ratio.
-            //   solidity = actual contour area / bounding box area
-            // A perfect rectangle → solidity ≈ 1.0
-            // A circle            → solidity ≈ 0.785
-            // A random blob       → solidity can be much lower
-            double solidity = area / (br.Width * (double)br.Height);
-            if (solidity < RectSolidity) continue; // not rectangular enough — skip
+            // Must have exactly 4 corners to be considered a rectangle.
+            // Interior squares will also pass this — the aspect ratio filter (next)
+            // handles them.
+            if (approx.Length != 4) continue;
 
-            // This contour is larger and more rectangular than our current best
+            // Filter c: aspect ratio — the barcode box must be significantly wider
+            // than tall because it holds 32 columns of squares across only 2 rows.
+            // Individual interior squares are roughly 1:1 (equal width and height)
+            // and get rejected here.
+            Rect   br          = Cv2.BoundingRect(approx);
+            double aspectRatio = br.Width / (double)br.Height;
+            if (aspectRatio < MinAspectRatio) continue;
+
+            // This candidate passed all three filters and is larger than the
+            // current best — promote it to best.
             bestArea = area;
             best     = br;
         }
 
-        // Returns null if no contour passed both filters
         return best;
     }
 
@@ -338,7 +402,7 @@ public class BinaryClockReader
     /// Core frame-by-frame processing loop, shared by both CropVideo overloads.
     /// csvPath being null means "don't write a CSV".
     /// </summary>
-    private void ProcessVideo(string inputPath, string outputPath, string? csvPath)
+    private void ProcessVideo(string inputPath, string outputPath, string? csvPath, HighlightColor boxColor)
     {
         // wantAlpha is true when the output container supports transparency.
         // .mov can carry a full BGRA (4-channel) image with per-pixel alpha.
@@ -472,8 +536,10 @@ public class BinaryClockReader
                     // Redraw the box border on top of the binarised interior.
                     // Without this the border would have been painted black or
                     // white by BinariseInterior, losing the visual indicator.
+                    // boxColor.ToScalar(wantAlpha) returns BGRA when the output
+                    // container supports alpha, BGR otherwise.
                     Cv2.Rectangle(processed, boxRect.Value,
-                        wantAlpha ? RedBgra : RedBgr, BorderThickness);
+                        boxColor.ToScalar(wantAlpha), BorderThickness);
                 }
 
                 // Write the finished frame to the output video
@@ -729,6 +795,104 @@ public class BinaryClockReader
         // completely outside the frame
         return new Rect(x, y, Math.Max(0, w), Math.Max(0, h));
     }
+}
+
+// ── HighlightColor ────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Represents an RGBA colour used to highlight the detected barcode box.
+///
+/// Create one using the static factory methods:
+///   HighlightColor.FromHex("#FF000064")   // #RRGGBBAA  (AA = alpha, 00=transparent FF=opaque)
+///   HighlightColor.FromRgba(255, 0, 0, 100)
+///   HighlightColor.Default                // #FF000064 — the original semi-transparent red
+///
+/// Why store RGBA but convert to BGR(A) on demand?
+///   OpenCV uses BGR channel order internally. We store the colour in the
+///   more familiar RGBA format and convert only when needed, keeping the
+///   public API intuitive.
+/// </summary>
+public readonly struct HighlightColor
+{
+    public byte R { get; }
+    public byte G { get; }
+    public byte B { get; }
+
+    /// <summary>
+    /// Alpha: 0 = fully transparent, 255 = fully opaque.
+    /// Note: alpha is only preserved in .mov output. MP4 discards it.
+    /// </summary>
+    public byte A { get; }
+
+    private HighlightColor(byte r, byte g, byte b, byte a)
+    {
+        R = r; G = g; B = b; A = a;
+    }
+
+    /// <summary>
+    /// The default box colour: semi-transparent red (#FF000064).
+    /// 0x64 = 100 in decimal — roughly 40% opacity.
+    /// </summary>
+    public static HighlightColor Default => new(255, 0, 0, 100);
+
+    /// <summary>
+    /// Creates a HighlightColor from individual R, G, B, A byte values (0–255).
+    /// Example: HighlightColor.FromRgba(0, 255, 0, 255) = solid green
+    /// </summary>
+    public static HighlightColor FromRgba(byte r, byte g, byte b, byte a = 255)
+        => new(r, g, b, a);
+
+    /// <summary>
+    /// Parses a hex colour string. Supported formats:
+    ///   "#RRGGBB"    — alpha defaults to 255 (fully opaque)
+    ///   "#RRGGBBAA"  — explicit alpha
+    ///   "#RGB"       — shorthand, each digit is doubled (e.g. #F00 → #FF0000)
+    ///
+    /// Examples:
+    ///   HighlightColor.FromHex("#FF0000")    // solid red
+    ///   HighlightColor.FromHex("#FF000064")  // semi-transparent red
+    ///   HighlightColor.FromHex("#0F0")       // shorthand solid green
+    /// </summary>
+    public static HighlightColor FromHex(string hex)
+    {
+        // Strip leading '#' if present
+        string h = hex.TrimStart('#');
+
+        // Expand 3-character shorthand: "F00" → "FF0000"
+        if (h.Length == 3)
+            h = $"{h[0]}{h[0]}{h[1]}{h[1]}{h[2]}{h[2]}";
+
+        if (h.Length != 6 && h.Length != 8)
+            throw new ArgumentException(
+                $"Unrecognised hex colour format: '{hex}'. " +
+                "Expected #RGB, #RRGGBB, or #RRGGBBAA.");
+
+        // Convert.ToByte with base 16 parses a two-character hex pair into a byte.
+        // e.g. "FF" → 255, "64" → 100, "00" → 0
+        byte r = Convert.ToByte(h[0..2], 16);
+        byte g = Convert.ToByte(h[2..4], 16);
+        byte b = Convert.ToByte(h[4..6], 16);
+        byte a = h.Length == 8 ? Convert.ToByte(h[6..8], 16) : (byte)255;
+
+        return new(r, g, b, a);
+    }
+
+    /// <summary>
+    /// Converts this colour to an OpenCV Scalar.
+    ///
+    /// OpenCV's channel order is BGR (not RGB), so we swap R and B.
+    /// When wantAlpha is true (i.e. the output is .mov) we include the
+    /// alpha value as the 4th channel. For .mp4 output the alpha channel
+    /// is ignored by the codec so we omit it (3-channel BGR Scalar).
+    /// </summary>
+    public Scalar ToScalar(bool wantAlpha)
+        // OpenCV Scalar channel order: (Blue, Green, Red [, Alpha])
+        => wantAlpha
+            ? new Scalar(B, G, R, A)
+            : new Scalar(B, G, R);
+
+    /// <summary>Returns a human-readable description e.g. "RGBA(255,0,0,100)"</summary>
+    public override string ToString() => $"RGBA({R},{G},{B},{A})";
 }
 
 // ── BinaryRows result type ────────────────────────────────────────────────────
