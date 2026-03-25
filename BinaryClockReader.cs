@@ -175,18 +175,23 @@ public class BinaryClockReader
     public int MinBorderValue { get; set; } = 20;
 
     /// <summary>
-    /// Size of the morphological closing kernel applied to the colour mask
-    /// before contour detection. Must be odd. Default 7.
-    ///
-    /// Morphological closing = dilation followed by erosion. It fills small gaps
-    /// and holes in the mask caused by H.264 compression artefacts on the border
-    /// pixels, reconnecting broken border segments into one solid outline.
-    ///
-    /// Increase (e.g. 11) if the border is very faint or the video is heavily
-    /// compressed. Decrease (e.g. 3) if nearby coloured objects are merging
-    /// with the border mask.
+    /// Size of the dilation kernel applied to the saturation mask to bridge
+    /// small compression gaps in the border ring before hole detection.
+    /// Must be odd. Default 3. Increase to 5 for heavily compressed video.
+    /// Unlike morphological close, plain dilation does NOT fill the interior
+    /// hole — it only thickens the border ring, which is exactly what we want
+    /// so the hole remains clearly defined.
     /// </summary>
-    public int MorphCloseSize { get; set; } = 7;
+    public int DilateSize { get; set; } = 3;
+
+    /// <summary>
+    /// How many pixels to expand the detected interior rect outward on each
+    /// side to recover the full outer rectangle including the border stroke.
+    /// Should match the visual thickness of your border in pixels.
+    /// Default 4. Increase if the border is thick or if the detected rect
+    /// is cutting into the border area.
+    /// </summary>
+    public int BorderExpansion { get; set; } = 4;
 
     /// <summary>
     /// Maximum X coordinate (in pixels) the left edge of the detected rectangle
@@ -259,111 +264,97 @@ public class BinaryClockReader
         => ProcessVideo(inputPath, outputPath, csvPath, boxColor);
 
     /// <summary>
-    /// Locates the barcode rectangle using HSV saturation masking.
+    /// Locates the barcode rectangle by finding the INTERIOR HOLE rather than
+    /// the border itself.
     ///
-    /// WHY SATURATION MASKING INSTEAD OF A SPECIFIC COLOUR OR EDGE DETECTION:
+    /// WHY THIS IS MORE RELIABLE THAN FINDING THE BORDER:
+    ///   The border colour shifts with HDR, tone-mapping, and codec changes.
+    ///   The interior is always the same: black squares and white squares —
+    ///   both have near-zero saturation and the whole stripe is visually
+    ///   distinctive regardless of what the border colour does.
     ///
-    ///   Colour-specific (HSV red range): works for red but misses brown, orange, etc.
-    ///
-    ///   Edge/contour detection: fragile because H.264 compression fragments the
-    ///   border into disconnected pieces. No single contour covers the full rectangle.
-    ///
-    ///   Saturation masking: instead of asking "is this pixel red?", we ask
-    ///   "is this pixel coloured at all?". Any pixel with sufficient HSV saturation
-    ///   passes. This means:
-    ///     • Red border  (#FF0000) → S≈255 ✓
-    ///     • Brown border (#502e1a) → S≈171 ✓
-    ///     • Orange, green, blue borders → all S >> 40 ✓
-    ///     • Black bit-squares → S≈0 ✗ (excluded)
-    ///     • White bit-squares → S≈0 ✗ (excluded)
-    ///     • Dark-gray video background → S &lt; 30 ✗ (excluded)
-    ///   The border is the only thing in the crop that is both coloured and rectangular.
-    ///
-    /// PIPELINE:
-    ///   1. Convert to HSV
-    ///   2. Threshold on saturation + minimum brightness → colour mask
-    ///      (isolates the border pixels regardless of their specific hue)
-    ///   3. Morphological close → fills gaps that compression broke in the border
-    ///   4. Find external contours → only the outermost outlines
-    ///   5. Filter by aspect ratio, pick the largest valid candidate
+    /// HOW IT WORKS — contour hierarchy hole detection:
+    ///   1. Saturation threshold → border pixels become WHITE, everything
+    ///      else (interior, background) becomes BLACK.
+    ///   2. Small dilation bridges compression gaps in the border ring without
+    ///      filling the interior hole (unlike morphological close).
+    ///   3. FindContours with CComp hierarchy returns every contour AND its
+    ///      parent. A contour that has a parent is a HOLE — it is the dark
+    ///      region enclosed by another contour. The interior of the barcode
+    ///      is exactly that hole inside the border ring.
+    ///   4. Find the hole whose aspect ratio is closest to ExpectedAspectRatio.
+    ///   5. Expand that rect outward by BorderExpansion pixels to include the
+    ///      border stroke, giving the full outer rectangle.
     /// </summary>
     public Rect? DetectBarcodeRect(Mat frame)
     {
-        using var hsv      = new Mat();
-        using var satMask  = new Mat(); // pixels that are "coloured enough"
-        using var closed   = new Mat(); // mask after morphological close
-        using var kernel   = Cv2.GetStructuringElement(
-                                 MorphShapes.Rect,
-                                 new Size(MorphCloseSize, MorphCloseSize));
+        using var hsv     = new Mat();
+        using var satMask = new Mat();
+        using var dilated = new Mat();
 
-        // Step 1: Convert BGR → HSV
-        // HSV separates colour (Hue + Saturation) from brightness (Value).
-        // This makes it easy to say "find anything coloured" without knowing
-        // what colour it is. In OpenCV, H is 0–180, S and V are 0–255.
+        // Step 1: BGR → HSV and threshold on saturation.
+        // The border (any colour) has high saturation. The black/white interior
+        // squares and the video background have near-zero saturation.
+        // Result: border = 255 (white), everything else = 0 (black).
         Cv2.CvtColor(frame, hsv, ColorConversionCodes.BGR2HSV);
-
-        // Step 2: Saturation + brightness threshold
-        // InRange(src, lowerBound, upperBound, dst) sets dst[i]=255 where
-        // lowerBound ≤ src[i] ≤ upperBound on every channel, 0 otherwise.
-        //
-        // We accept any hue (H: 0–180 = full range), require saturation above
-        // MinSaturation so black/white/gray pixels are excluded, and require
-        // brightness above MinBorderValue so near-black noise is excluded.
         Cv2.InRange(hsv,
-            lowerb: new Scalar(0,              MinSaturation, MinBorderValue),
-            upperb: new Scalar(180,            255,           255),
+            lowerb: new Scalar(0,   MinSaturation, MinBorderValue),
+            upperb: new Scalar(180, 255,           255),
             dst:    satMask);
 
-        // Step 3: Morphological close
-        // MorphTypes.Close = Dilate then Erode.
-        // Dilation grows every white pixel outward by (MorphCloseSize/2) pixels,
-        // bridging gaps between fragments of the border.
-        // Erosion then shrinks back to roughly the original size, but the gaps
-        // that were filled stay filled — they become connected.
-        // Net effect: small holes and breaks in the border outline are healed.
-        Cv2.MorphologyEx(satMask, closed, MorphTypes.Close, kernel);
+        // Step 2: Small dilation to bridge compression gaps in the border ring.
+        // We use plain dilation (NOT close) so the interior hole stays dark.
+        // The dilation only thickens the border ring — it cannot fill the hole
+        // because it grows outward from existing white pixels, and the interior
+        // is fully surrounded by background black, not border white.
+        if (DilateSize > 1)
+        {
+            using var k = Cv2.GetStructuringElement(
+                MorphShapes.Rect, new Size(DilateSize, DilateSize));
+            Cv2.Dilate(satMask, dilated, k);
+        }
+        else
+        {
+            satMask.CopyTo(dilated);
+        }
 
-        // Step 4: Find contours in the closed mask.
-        // RetrievalModes.External: only the outermost outlines — the interior
-        // bit-squares are nested inside the box and are automatically ignored.
-        Cv2.FindContours(closed, out Point[][] contours, out _,
-            RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+        // Step 3: Find contours WITH hierarchy using CComp mode.
+        // CComp (Connected Components) returns two levels of hierarchy:
+        //   Level 0: outermost contours (the border rings)
+        //   Level 1: holes inside level-0 contours (the interior regions)
+        //
+        // hierarchy[i] is a 4-element array: [next, prev, firstChild, parent]
+        //   next      = index of next contour at the same level (-1 if none)
+        //   prev      = index of previous contour at the same level (-1 if none)
+        //   firstChild= index of first child contour (-1 if none)
+        //   parent    = index of parent contour (-1 if this is outermost)
+        //
+        // A contour whose parent >= 0 is a HOLE inside its parent contour.
+        // The interior of the barcode is a hole inside the border ring contour.
+        Cv2.FindContours(dilated, out Point[][] contours, out HierarchyIndex[] hierarchy,
+            RetrievalModes.CComp, ContourApproximationModes.ApproxSimple);
 
-        // Step 5: Among all candidates that pass the saturation mask and the
-        // aspect ratio window, pick the one whose ratio is CLOSEST to
-        // ExpectedAspectRatio (8.75 for a 35×4 grid).
-        //
-        // WHY RATIO PROXIMITY BEATS SIZE:
-        //   Picking the largest fails  → whole frame or surrounding UI wins.
-        //   Picking the smallest fails → noise blobs or small coloured icons win.
-        //   Picking the closest ratio  → nothing else in a typical frame has
-        //   a ratio of exactly 8.75, so the barcode rectangle wins every time.
-        //
-        // Similarity = min(ratio, expected) / max(ratio, expected)
-        //   → 1.0 when they match exactly
-        //   → approaches 0 as they diverge
-        // We multiply by area so that among equally-shaped candidates the
-        // larger (more visible, more complete) one wins.
         Rect?  best      = null;
         double bestScore = -1;
 
-        foreach (var contour in contours)
+        for (int i = 0; i < contours.Length; i++)
         {
-            double area = Cv2.ContourArea(contour);
+            // Only consider holes — contours that are INSIDE another contour.
+            // hierarchy[i].Parent >= 0 means this contour has a parent, i.e. it
+            // is the dark interior enclosed by the white border ring.
+            if (hierarchy[i].Parent < 0) continue;
+
+            double area = Cv2.ContourArea(contours[i]);
             if (area < MinBoxArea) continue;
 
-            Rect   br    = Cv2.BoundingRect(contour);
+            Rect   br    = Cv2.BoundingRect(contours[i]);
             double ratio = br.Width / (double)br.Height;
 
             if (ratio < MinAspectRatio || ratio > MaxAspectRatio) continue;
 
-            // How close is this ratio to the expected 8.75?
-            // Result is 1.0 for a perfect match, lower for anything else.
+            // Score by how close this hole's ratio is to the expected 8.75.
             double similarity = Math.Min(ratio, ExpectedAspectRatio)
                               / Math.Max(ratio, ExpectedAspectRatio);
-
-            // Weight by area so a full solid border beats a tiny fragment that
-            // happens to have the right ratio due to luck.
             double score = similarity * area;
 
             if (score > bestScore)
@@ -371,6 +362,20 @@ public class BinaryClockReader
                 bestScore = score;
                 best      = br;
             }
+        }
+
+        // Step 4: Expand the interior rect outward by BorderExpansion pixels
+        // to recover the full outer rectangle including the border stroke.
+        if (best.HasValue)
+        {
+            var b = best.Value;
+            best = ClampRect(
+                new Rect(
+                    b.X      - BorderExpansion,
+                    b.Y      - BorderExpansion,
+                    b.Width  + BorderExpansion * 2,
+                    b.Height + BorderExpansion * 2),
+                frame.Cols, frame.Rows);
         }
 
         return best;
