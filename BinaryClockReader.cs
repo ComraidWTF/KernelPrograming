@@ -123,17 +123,32 @@ public class BinaryClockReader
     public double MinBoxArea { get; set; } = 500;
 
     /// <summary>
-    /// Minimum width-to-height ratio the detected box must satisfy.
-    /// With 32 columns and 2 rows the box is always wider than tall.
-    /// 2.0 rules out individual bit-squares and tall rectangles.
+    /// Minimum width-to-height ratio. With 35 squares wide and 4 squares tall
+    /// the expected ratio is 8.75. 5.0 gives a comfortable lower bound.
     /// </summary>
-    public double MinAspectRatio { get; set; } = 2.0;
+    public double MinAspectRatio { get; set; } = 5.0;
 
     /// <summary>
-    /// Maximum width-to-height ratio. 30.0 rules out very thin horizontal lines
-    /// (subtitle bars etc.) while keeping any realistic barcode box.
+    /// Maximum width-to-height ratio. 13.0 gives a comfortable upper bound
+    /// around the expected 8.75 while excluding thin letterbox bars and the
+    /// full frame (which would be ~1.78 for 16:9 — well outside this range).
     /// </summary>
-    public double MaxAspectRatio { get; set; } = 30.0;
+    public double MaxAspectRatio { get; set; } = 13.0;
+
+    /// <summary>
+    /// The exact aspect ratio the barcode rectangle should have.
+    /// 35 bit-squares wide ÷ 4 bit-squares tall = 8.75.
+    ///
+    /// This is the key discriminator: among all candidates that pass the
+    /// saturation mask and aspect ratio window, the one whose ratio is
+    /// CLOSEST to this value wins — not the largest, not the smallest.
+    /// Nothing else in a typical video frame has an aspect ratio of exactly
+    /// 8.75, so this reliably picks the right rectangle even when the whole
+    /// frame or other wide elements also pass the min/max filter.
+    ///
+    /// Adjust if your barcode grid has different dimensions.
+    /// </summary>
+    public double ExpectedAspectRatio { get; set; } = 8.75;
 
     /// <summary>
     /// Minimum HSV saturation (0–255) a pixel must have to be treated as part
@@ -173,8 +188,22 @@ public class BinaryClockReader
     /// </summary>
     public int MorphCloseSize { get; set; } = 7;
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // COLOUR CONSTANTS
+    /// <summary>
+    /// Maximum X coordinate (in pixels) the left edge of the detected rectangle
+    /// may have. Since the barcode is always drawn at the left edge of the frame,
+    /// any candidate whose left edge is further right than this is a false hit
+    /// and will not update the cache.
+    /// Default 0.15 = left edge must be within the leftmost 15% of the crop width.
+    /// </summary>
+    public double MaxLeftEdgeFraction { get; set; } = 0.15;
+
+    /// <summary>
+    /// Minimum Y coordinate fraction the top edge of the detected rectangle
+    /// must have. Since the barcode is drawn at the bottom of the crop region,
+    /// any candidate whose top edge is higher than this is a false hit.
+    /// Default 0.4 = top edge must be in the lower 60% of the crop height.
+    /// </summary>
+    public double MinTopEdgeFraction { get; set; } = 0.4;
     //
     // OpenCV stores colours in BGR order (Blue, Green, Red) — the opposite
     // of the more familiar RGB. So (0, 0, 255) is pure red, not pure blue.
@@ -300,26 +329,48 @@ public class BinaryClockReader
         Cv2.FindContours(closed, out Point[][] contours, out _,
             RetrievalModes.External, ContourApproximationModes.ApproxSimple);
 
-        // Step 5: Filter candidates by area and aspect ratio; pick the largest
+        // Step 5: Among all candidates that pass the saturation mask and the
+        // aspect ratio window, pick the one whose ratio is CLOSEST to
+        // ExpectedAspectRatio (8.75 for a 35×4 grid).
+        //
+        // WHY RATIO PROXIMITY BEATS SIZE:
+        //   Picking the largest fails  → whole frame or surrounding UI wins.
+        //   Picking the smallest fails → noise blobs or small coloured icons win.
+        //   Picking the closest ratio  → nothing else in a typical frame has
+        //   a ratio of exactly 8.75, so the barcode rectangle wins every time.
+        //
+        // Similarity = min(ratio, expected) / max(ratio, expected)
+        //   → 1.0 when they match exactly
+        //   → approaches 0 as they diverge
+        // We multiply by area so that among equally-shaped candidates the
+        // larger (more visible, more complete) one wins.
         Rect?  best      = null;
-        double bestArea  = MinBoxArea; // doubles as the "minimum area to qualify" gate
+        double bestScore = -1;
 
         foreach (var contour in contours)
         {
             double area = Cv2.ContourArea(contour);
-            if (area < bestArea) continue; // too small — noise, text, UI decoration
+            if (area < MinBoxArea) continue;
 
             Rect   br    = Cv2.BoundingRect(contour);
             double ratio = br.Width / (double)br.Height;
 
-            // The barcode is always wider than tall (32 cols × 2 rows).
-            // This single filter eliminates individual bit-squares (ratio ≈ 1)
-            // and tall thin objects (ratio < MinAspectRatio), while MaxAspectRatio
-            // rules out wide letterbox bars and subtitle lines.
             if (ratio < MinAspectRatio || ratio > MaxAspectRatio) continue;
 
-            bestArea = area; // new winner — update threshold so next must be larger
-            best     = br;
+            // How close is this ratio to the expected 8.75?
+            // Result is 1.0 for a perfect match, lower for anything else.
+            double similarity = Math.Min(ratio, ExpectedAspectRatio)
+                              / Math.Max(ratio, ExpectedAspectRatio);
+
+            // Weight by area so a full solid border beats a tiny fragment that
+            // happens to have the right ratio due to luck.
+            double score = similarity * area;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best      = br;
+            }
         }
 
         return best;
@@ -359,9 +410,9 @@ public class BinaryClockReader
             // Crop the bottom-left region — same as the main pipeline
             new Mat(srcFrame, new Rect(0, cropY, cropW, cropH)).CopyTo(cropped);
 
-            // Try to detect the barcode rectangle in this frame
+            // Try to detect the barcode rectangle, validating position first
             Rect? box = DetectBarcodeRect(cropped);
-            if (box.HasValue)
+            if (box.HasValue && IsValidPosition(box.Value, cropW, cropH))
             {
                 // Try to read the bit rows from the detected box
                 BinaryRows? rows = ReadBinaryRows(cropped, box.Value);
@@ -559,11 +610,13 @@ public class BinaryClockReader
                 new Mat(srcFrame, new Rect(cropX, cropY, cropW, cropH)).CopyTo(cropped);
 
                 // ── Step 2: Detect the barcode rectangle ─────────────────────
-                // DetectBarcodeRect uses Canny edges to find the box regardless
-                // of what colour it is (red, brown, etc.).
+                // Only update the cache when the detected rect is genuinely in
+                // the bottom-left. If detection finds a wrong rect (e.g. a UI
+                // element elsewhere in the frame) we keep the last known good
+                // position rather than corrupting the cache with a false hit.
                 Rect? detected = DetectBarcodeRect(cropped);
-                if (detected.HasValue)
-                    boxRect = detected.Value; // update cache with fresh detection
+                if (detected.HasValue && IsValidPosition(detected.Value, cropW, cropH))
+                    boxRect = detected.Value;
 
                 // ── Step 3: Prepare the output frame ─────────────────────────
                 // We start from a copy of the cropped frame and then paint
@@ -837,6 +890,29 @@ public class BinaryClockReader
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Returns true if the detected rectangle is plausibly the barcode box —
+    /// i.e. its left edge is near the left of the crop and its top edge is
+    /// in the lower portion of the crop (since the box is always bottom-left).
+    ///
+    /// This prevents a wrong detection from corrupting the cache. Without this
+    /// guard, a false hit anywhere in the frame would overwrite the cached rect
+    /// and cause every subsequent cached frame to read bits from the wrong area.
+    /// </summary>
+    private bool IsValidPosition(Rect r, int frameW, int frameH)
+    {
+        // Left edge must be within the leftmost MaxLeftEdgeFraction of the crop.
+        // e.g. 0.15 × 384px = left edge must be ≤ 57px from the left.
+        double maxLeft = frameW * MaxLeftEdgeFraction;
+
+        // Top edge must be below MinTopEdgeFraction of the crop height.
+        // e.g. 0.4 × 216px = top edge must be ≥ 86px from the top of the crop
+        // (i.e. in the lower 60% of the crop, which is the bottom of the frame).
+        double minTop = frameH * MinTopEdgeFraction;
+
+        return r.X <= maxLeft && r.Y >= minTop;
     }
 
     /// <summary>
