@@ -6,7 +6,7 @@
 using OpenCvSharp;
 using System.Text;
 
-public class BinaryClockReader
+public class BinaryClockReader : IDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
 
@@ -49,8 +49,15 @@ public class BinaryClockReader
     /// <summary>Minimum HSV brightness (0–255) for a pixel to be treated as the coloured border.</summary>
     public int MinBorderValue { get; set; } = 20;
 
-    /// <summary>Dilation kernel size applied to the saturation mask to bridge compression gaps. Must be odd.</summary>
-    public int DilateSize { get; set; } = 3;
+    /// <summary>
+    /// Dilation kernel size applied to the saturation mask to bridge compression gaps. Must be odd.
+    /// Changing this after the first call to DetectBarcodeRect will rebuild the cached kernel.
+    /// </summary>
+    public int DilateSize
+    {
+        get => _dilateSize;
+        set { _dilateSize = value; RebuildDilateKernel(); }
+    }
 
     /// <summary>Pixels to expand the detected interior rect outward to include the border stroke.</summary>
     public int BorderExpansion { get; set; } = 4;
@@ -63,6 +70,44 @@ public class BinaryClockReader
     private static readonly Scalar RedBgra   = new(0,   0,   255, 100);
     private static readonly Scalar WhiteBgr  = new(255, 255, 255);
     private static readonly Scalar WhiteBgra = new(255, 255, 255, 255);
+
+    // ── Pooled Mats — allocated once, reused every frame ─────────────────────
+    // Allocating and immediately disposing Mats inside hot loops creates GC
+    // pressure. These fields are pre-allocated and reused across calls.
+
+    // DetectBarcodeRect
+    private readonly Mat _hsv     = new();
+    private readonly Mat _satMask = new();
+    private readonly Mat _dilated = new();
+
+    // ReadBinaryRows / BinariseInterior (shared pipeline)
+    private readonly Mat _gray     = new();
+    private readonly Mat _denoised = new();
+    private readonly Mat _binary   = new();
+    private readonly Mat _dark     = new();
+    private readonly Mat _light    = new();
+
+    // ExtractBits — projection buffers
+    private readonly Mat _topProj = new(); // 1 × width, top-half column means
+    private readonly Mat _botProj = new(); // 1 × width, bottom-half column means
+
+    // Cached dilation kernel — rebuilt only when DilateSize changes
+    private Mat  _dilateKernel;
+    private int  _dilateSize = 3;
+
+    public BinaryClockReader()
+    {
+        _dilateKernel = Cv2.GetStructuringElement(
+            MorphShapes.Rect, new Size(_dilateSize, _dilateSize));
+    }
+
+    private void RebuildDilateKernel()
+    {
+        _dilateKernel.Dispose();
+        _dilateKernel = _dilateSize > 1
+            ? Cv2.GetStructuringElement(MorphShapes.Rect, new Size(_dilateSize, _dilateSize))
+            : new Mat();
+    }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -88,28 +133,19 @@ public class BinaryClockReader
     /// </summary>
     public Rect? DetectBarcodeRect(Mat frame)
     {
-        using var hsv     = new Mat();
-        using var satMask = new Mat();
-        using var dilated = new Mat();
-
-        Cv2.CvtColor(frame, hsv, ColorConversionCodes.BGR2HSV);
-        Cv2.InRange(hsv,
+        // Reuse pooled Mats — no allocation on the hot path
+        Cv2.CvtColor(frame, _hsv, ColorConversionCodes.BGR2HSV);
+        Cv2.InRange(_hsv,
             lowerb: new Scalar(0,   MinSaturation, MinBorderValue),
             upperb: new Scalar(180, 255,           255),
-            dst:    satMask);
+            dst:    _satMask);
 
-        if (DilateSize > 1)
-        {
-            using var k = Cv2.GetStructuringElement(
-                MorphShapes.Rect, new Size(DilateSize, DilateSize));
-            Cv2.Dilate(satMask, dilated, k);
-        }
+        if (_dilateSize > 1)
+            Cv2.Dilate(_satMask, _dilated, _dilateKernel);
         else
-        {
-            satMask.CopyTo(dilated);
-        }
+            _satMask.CopyTo(_dilated);
 
-        Cv2.FindContours(dilated, out Point[][] contours, out HierarchyIndex[] hierarchy,
+        Cv2.FindContours(_dilated, out Point[][] contours, out HierarchyIndex[] hierarchy,
             RetrievalModes.CComp, ContourApproximationModes.ApproxSimple);
 
         Rect?  best      = null;
@@ -124,29 +160,21 @@ public class BinaryClockReader
 
             Rect   br    = Cv2.BoundingRect(contours[i]);
             double ratio = br.Width / (double)br.Height;
-
             if (ratio < MinAspectRatio || ratio > MaxAspectRatio) continue;
 
             double similarity = Math.Min(ratio, ExpectedAspectRatio)
                               / Math.Max(ratio, ExpectedAspectRatio);
             double score = similarity * area;
 
-            if (score > bestScore)
-            {
-                bestScore = score;
-                best      = br;
-            }
+            if (score > bestScore) { bestScore = score; best = br; }
         }
 
         if (best.HasValue)
         {
             var b = best.Value;
             best = ClampRect(
-                new Rect(
-                    b.X      - BorderExpansion,
-                    b.Y      - BorderExpansion,
-                    b.Width  + BorderExpansion * 2,
-                    b.Height + BorderExpansion * 2),
+                new Rect(b.X - BorderExpansion, b.Y - BorderExpansion,
+                         b.Width + BorderExpansion * 2, b.Height + BorderExpansion * 2),
                 frame.Cols, frame.Rows);
         }
 
@@ -204,26 +232,34 @@ public class BinaryClockReader
         if (interior.Width <= 4 || interior.Height <= 4)
             return null;
 
-        using var interiorCropped  = new Mat(frame, interior);
-        using var interiorGray     = new Mat();
-        using var interiorDenoised = new Mat();
-        using var interiorBinary   = new Mat();
+        // Sub-Mat is a zero-copy view — no pixel data duplicated
+        using var interiorView = new Mat(frame, interior);
 
-        Cv2.CvtColor(interiorCropped, interiorGray, ColorConversionCodes.BGR2GRAY);
+        Cv2.CvtColor(interiorView, _gray, ColorConversionCodes.BGR2GRAY);
 
         if (DenoiseSize > 1)
-            Cv2.MedianBlur(interiorGray, interiorDenoised, DenoiseSize);
+            Cv2.MedianBlur(_gray, _denoised, DenoiseSize);
         else
-            interiorGray.CopyTo(interiorDenoised);
+            _gray.CopyTo(_denoised);
 
-        Cv2.Threshold(interiorDenoised, interiorBinary, 0, 255,
+        Cv2.Threshold(_denoised, _binary, 0, 255,
             ThresholdTypes.Binary | ThresholdTypes.Otsu);
 
-        int cols = NumCols > 0 ? NumCols : DetectColumnCount(interiorBinary);
+        int cols = NumCols > 0 ? NumCols : DetectColumnCount(_binary);
         if (cols <= 0) return null;
 
-        var (row0, row1) = ExtractBits(interiorBinary, cols);
+        var (row0, row1) = ExtractBits(_binary, cols);
         return new BinaryRows(row0, row1);
+    }
+
+    /// <summary>Dispose all pooled Mats and the cached dilation kernel.</summary>
+    public void Dispose()
+    {
+        _hsv.Dispose();  _satMask.Dispose(); _dilated.Dispose();
+        _gray.Dispose(); _denoised.Dispose(); _binary.Dispose();
+        _dark.Dispose(); _light.Dispose();
+        _topProj.Dispose(); _botProj.Dispose();
+        _dilateKernel.Dispose();
     }
 
     // ── Private implementation ────────────────────────────────────────────────
@@ -256,12 +292,9 @@ public class BinaryClockReader
                 BinaryRows? rows = ReadBinaryRows(cropped, box.Value);
                 if (rows != null)
                 {
-                    if (checkParity && !CheckParity(rows.Row1))
-                    {
-                        frameIdx++;
-                        continue;
-                    }
-                    return new BarcodeFrameResult(frameIdx, TimeSpan.FromSeconds(frameIdx / fps), rows, box.Value);
+                    if (checkParity && !CheckParity(rows.Row1)) { frameIdx++; continue; }
+                    return new BarcodeFrameResult(frameIdx,
+                        TimeSpan.FromSeconds(frameIdx / fps), rows, box.Value);
                 }
             }
             frameIdx++;
@@ -305,6 +338,7 @@ public class BinaryClockReader
             : null;
         csv?.WriteLine("frame,timestamp_ms,row0,row1,row0_hex,row1_hex");
 
+        // All frame-level Mats pre-allocated outside the loop
         using var srcFrame  = new Mat();
         using var cropped   = new Mat();
         using var processed = new Mat();
@@ -316,12 +350,10 @@ public class BinaryClockReader
             while (capture.Read(srcFrame) && !srcFrame.Empty())
             {
                 double timestampMs = frameIdx * 1000.0 / fps;
-
                 new Mat(srcFrame, new Rect(cropX, cropY, cropW, cropH)).CopyTo(cropped);
 
                 Rect? detected = DetectBarcodeRect(cropped);
-                if (detected.HasValue)
-                    boxRect = detected.Value;
+                if (detected.HasValue) boxRect = detected.Value;
 
                 if (wantAlpha)
                     Cv2.CvtColor(cropped, processed, ColorConversionCodes.BGR2BGRA);
@@ -336,12 +368,10 @@ public class BinaryClockReader
                     {
                         BinaryRows? rows = ReadBinaryRows(cropped, boxRect.Value);
                         if (rows != null)
-                        {
                             csv.WriteLine(
                                 $"{frameIdx},{timestampMs:F1}," +
                                 $"{string.Concat(rows.Row0)},{string.Concat(rows.Row1)}," +
                                 $"{rows.Row0Hex},{rows.Row1Hex}");
-                        }
                     }
 
                     Cv2.Rectangle(processed, boxRect.Value, boxColor.ToScalar(wantAlpha), BorderThickness);
@@ -370,34 +400,28 @@ public class BinaryClockReader
     {
         int inset    = BorderThickness + 1;
         var interior = ClampRect(new Rect(
-            boxRect.X + inset,
-            boxRect.Y + inset,
+            boxRect.X + inset, boxRect.Y + inset,
             Math.Max(1, boxRect.Width  - inset * 2),
             Math.Max(1, boxRect.Height - inset * 2)),
             source.Cols, source.Rows);
 
         if (interior.Width <= 4 || interior.Height <= 4) return;
 
-        using var interiorCropped  = new Mat(source, interior);
-        using var interiorGray     = new Mat();
-        using var interiorDenoised = new Mat();
-        using var interiorBinary   = new Mat();
-        using var interiorDark     = new Mat();
-        using var interiorLight    = new Mat();
+        using var interiorView = new Mat(source, interior);
 
-        Cv2.CvtColor(interiorCropped, interiorGray, ColorConversionCodes.BGR2GRAY);
+        Cv2.CvtColor(interiorView, _gray, ColorConversionCodes.BGR2GRAY);
         if (DenoiseSize > 1)
-            Cv2.MedianBlur(interiorGray, interiorDenoised, DenoiseSize);
+            Cv2.MedianBlur(_gray, _denoised, DenoiseSize);
         else
-            interiorGray.CopyTo(interiorDenoised);
+            _gray.CopyTo(_denoised);
 
-        Cv2.Threshold(interiorDenoised, interiorBinary, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
-        Cv2.Threshold(interiorBinary, interiorDark,  127, 255, ThresholdTypes.BinaryInv);
-        Cv2.Threshold(interiorBinary, interiorLight, 127, 255, ThresholdTypes.Binary);
+        Cv2.Threshold(_denoised, _binary, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
+        Cv2.Threshold(_binary, _dark,  127, 255, ThresholdTypes.BinaryInv);
+        Cv2.Threshold(_binary, _light, 127, 255, ThresholdTypes.Binary);
 
         using var roi = new Mat(target, interior);
-        roi.SetTo(wantAlpha ? BlackBgra : BlackBgr, interiorDark);
-        roi.SetTo(wantAlpha ? WhiteBgra : WhiteBgr, interiorLight);
+        roi.SetTo(wantAlpha ? BlackBgra : BlackBgr, _dark);
+        roi.SetTo(wantAlpha ? WhiteBgra : WhiteBgr, _light);
     }
 
     private (int[] row0, int[] row1) ExtractBits(Mat binary, int expectedCols)
@@ -407,39 +431,40 @@ public class BinaryClockReader
         int rowH = h / 2;
         int botH = h - rowH;
 
-        // Step 1: Project the top half (row0 clock signal) into a 1D array.
-        // Each element is the mean brightness of that column across the top rows.
-        // Since row0 always alternates 0,1,0,1... this produces an alternating
-        // low/high waveform whose transitions mark the actual cell boundaries.
-        using var topHalf = new Mat(binary, new Rect(0, 0, w, rowH));
-        using var projMat = new Mat();
-        Cv2.Reduce(topHalf, projMat, ReduceDimension.Row, ReduceTypes.Avg, MatType.CV_32F);
-        projMat.GetArray(out float[] brightness);
+        // Project both halves into 1D per-column brightness arrays in one pass.
+        // This replaces (2 × dataCols) sub-Mat + Cv2.Mean calls per frame with
+        // just 2 Cv2.Reduce calls + array arithmetic.
+        using var topView = new Mat(binary, new Rect(0, 0,    w, rowH));
+        using var botView = new Mat(binary, new Rect(0, rowH, w, botH));
 
-        // Step 2: Classify each column as light or dark by thresholding at the mean.
-        float mean = 0;
-        for (int x = 0; x < brightness.Length; x++) mean += brightness[x];
-        mean /= brightness.Length;
+        Cv2.Reduce(topView, _topProj, ReduceDimension.Row, ReduceTypes.Avg, MatType.CV_32F);
+        Cv2.Reduce(botView, _botProj, ReduceDimension.Row, ReduceTypes.Avg, MatType.CV_32F);
 
-        bool[] light = new bool[w];
-        for (int x = 0; x < w; x++) light[x] = brightness[x] > mean;
+        _topProj.GetArray(out float[] topBrightness);
+        _botProj.GetArray(out float[] botBrightness);
 
-        // Step 3: Find contiguous runs of the same classification.
-        // Each run corresponds to one cell (or a noise fragment to be merged).
-        var runs = new List<(int start, int end)>();
+        // Classify each column as light or dark based on the top-half projection.
+        // Row0 always alternates 0,1,0,1 so the mean sits cleanly between the two clusters.
+        float topMean = 0;
+        for (int x = 0; x < w; x++) topMean += topBrightness[x];
+        topMean /= w;
+
+        bool[] isLight = new bool[w];
+        for (int x = 0; x < w; x++) isLight[x] = topBrightness[x] > topMean;
+
+        // Build runs of contiguous same-classification columns
+        var runs = new List<(int start, int end)>(expectedCols + 4);
         int runStart = 0;
         for (int x = 1; x <= w; x++)
         {
-            if (x == w || light[x] != light[runStart])
+            if (x == w || isLight[x] != isLight[runStart])
             {
                 runs.Add((runStart, x - 1));
                 runStart = x;
             }
         }
 
-        // Step 4: Merge tiny noise runs caused by H.264 compression artifacts.
-        // A real cell is at least (totalWidth / (expectedCols * 4)) pixels wide.
-        // Anything smaller is noise — absorb it into its smallest neighbour.
+        // Merge noise runs (narrower than 1/4 of expected cell width)
         int minWidth = Math.Max(2, w / (expectedCols * 4));
         bool merged  = true;
         while (merged && runs.Count > 1)
@@ -450,7 +475,7 @@ public class BinaryClockReader
                 if ((runs[i].end - runs[i].start + 1) >= minWidth) continue;
 
                 int mergeWith;
-                if      (i == 0)             mergeWith = 1;
+                if      (i == 0)              mergeWith = 1;
                 else if (i == runs.Count - 1) mergeWith = i - 1;
                 else
                 {
@@ -469,13 +494,10 @@ public class BinaryClockReader
             }
         }
 
-        // Step 5: If compression merged two cells into one wide run we end up with
-        // fewer runs than expected. If noise split one cell into two we have more.
-        // Trim excess by merging the two adjacent narrowest runs until count matches.
+        // If still too many runs, merge the two narrowest adjacent ones repeatedly
         while (runs.Count > expectedCols)
         {
-            int bestIdx      = 0;
-            int bestCombined = int.MaxValue;
+            int bestIdx = 0, bestCombined = int.MaxValue;
             for (int i = 0; i < runs.Count - 1; i++)
             {
                 int combined = (runs[i].end - runs[i].start) + (runs[i + 1].end - runs[i + 1].start);
@@ -485,11 +507,14 @@ public class BinaryClockReader
             runs.RemoveAt(bestIdx + 1);
         }
 
-        // Step 6: Skip run 0 (sync square) and sample both rows using the
-        // exact column boundaries derived from the row0 clock signal.
+        // Skip run 0 (sync square); sample both rows from the projection arrays
         int dataCols = runs.Count - 1;
         var row0Data = new int[dataCols];
         var row1Data = new int[dataCols];
+
+        float botMean = 0;
+        for (int x = 0; x < w; x++) botMean += botBrightness[x];
+        botMean /= w;
 
         for (int i = 1; i < runs.Count; i++)
         {
@@ -497,19 +522,23 @@ public class BinaryClockReader
             int cw   = ce - cs + 1;
             int padX = (int)(cw * (1 - SampleFraction) / 2);
             int sx   = cs + padX;
-            int sw   = Math.Max(1, cw - padX * 2);
+            int ex   = ce - padX;
 
-            // Sample top row (row0)
-            int topPad = (int)(rowH * (1 - SampleFraction) / 2);
-            var topRect = ClampRect(new Rect(sx, topPad, sw, Math.Max(1, rowH - topPad * 2)), w, h);
-            using var topCell = new Mat(binary, topRect);
-            row0Data[i - 1] = (Cv2.Mean(topCell).Val0 / 255.0) >= WhiteVoteThreshold ? 1 : 0;
+            // Average the projection values over the inset column range —
+            // equivalent to Cv2.Mean on a sub-Mat but without any allocation.
+            float topSum = 0, botSum = 0;
+            int   count  = 0;
+            for (int x = sx; x <= ex; x++)
+            {
+                topSum += topBrightness[x];
+                botSum += botBrightness[x];
+                count++;
+            }
 
-            // Sample bottom row (row1) using the same column range
-            int botPad = (int)(botH * (1 - SampleFraction) / 2);
-            var botRect = ClampRect(new Rect(sx, rowH + botPad, sw, Math.Max(1, botH - botPad * 2)), w, h);
-            using var botCell = new Mat(binary, botRect);
-            row1Data[i - 1] = (Cv2.Mean(botCell).Val0 / 255.0) >= WhiteVoteThreshold ? 1 : 0;
+            if (count == 0) continue;
+
+            row0Data[i - 1] = (topSum / count / 255f) >= WhiteVoteThreshold ? 1 : 0;
+            row1Data[i - 1] = (botSum / count / 255f) >= WhiteVoteThreshold ? 1 : 0;
         }
 
         return (row0Data, row1Data);
@@ -526,7 +555,7 @@ public class BinaryClockReader
         mean /= vals.Length;
         float threshold = mean * 0.5f;
 
-        int  cols    = 0;
+        int  cols = 0;
         bool inWhite = false;
         foreach (float v in vals)
         {
