@@ -123,32 +123,21 @@ public class BinaryClockReader
     public double MinBoxArea { get; set; } = 500;
 
     /// <summary>
-    /// Minimum width-to-height ratio. With 35 squares wide and 4 squares tall
-    /// the expected ratio is 8.75. 5.0 gives a comfortable lower bound.
+    /// Minimum aspect ratio of the interior hole. 10.0 comfortably below 16.5.
     /// </summary>
-    public double MinAspectRatio { get; set; } = 5.0;
+    public double MinAspectRatio { get; set; } = 10.0;
 
     /// <summary>
-    /// Maximum width-to-height ratio. 13.0 gives a comfortable upper bound
-    /// around the expected 8.75 while excluding thin letterbox bars and the
-    /// full frame (which would be ~1.78 for 16:9 — well outside this range).
+    /// Maximum aspect ratio of the interior hole. 25.0 comfortably above 16.5.
     /// </summary>
-    public double MaxAspectRatio { get; set; } = 13.0;
+    public double MaxAspectRatio { get; set; } = 25.0;
 
     /// <summary>
-    /// The exact aspect ratio the barcode rectangle should have.
-    /// 35 bit-squares wide ÷ 4 bit-squares tall = 8.75.
-    ///
-    /// This is the key discriminator: among all candidates that pass the
-    /// saturation mask and aspect ratio window, the one whose ratio is
-    /// CLOSEST to this value wins — not the largest, not the smallest.
-    /// Nothing else in a typical video frame has an aspect ratio of exactly
-    /// 8.75, so this reliably picks the right rectangle even when the whole
-    /// frame or other wide elements also pass the min/max filter.
-    ///
-    /// Adjust if your barcode grid has different dimensions.
+    /// The exact aspect ratio the interior hole should have.
+    /// 33 bit-squares wide ÷ 2 bit-squares tall = 16.5.
+    /// The candidate hole closest to this ratio wins.
     /// </summary>
-    public double ExpectedAspectRatio { get; set; } = 8.75;
+    public double ExpectedAspectRatio { get; set; } = 16.5;
 
     /// <summary>
     /// Minimum HSV saturation (0–255) a pixel must have to be treated as part
@@ -193,33 +182,8 @@ public class BinaryClockReader
     /// </summary>
     public int BorderExpansion { get; set; } = 4;
 
-    /// <summary>
-    /// Maximum X coordinate (in pixels) the left edge of the detected rectangle
-    /// may have. Since the barcode is always drawn at the left edge of the frame,
-    /// any candidate whose left edge is further right than this is a false hit
-    /// and will not update the cache.
-    /// Default 0.15 = left edge must be within the leftmost 15% of the crop width.
-    /// </summary>
-    public double MaxLeftEdgeFraction { get; set; } = 0.15;
-
-    /// <summary>
-    /// Minimum Y coordinate fraction the top edge of the detected rectangle
-    /// must have. Since the barcode is drawn at the bottom of the crop region,
-    /// any candidate whose top edge is higher than this is a false hit.
-    /// Default 0.4 = top edge must be in the lower 60% of the crop height.
-    /// </summary>
-    public double MinTopEdgeFraction { get; set; } = 0.4;
-    //
-    // OpenCV stores colours in BGR order (Blue, Green, Red) — the opposite
-    // of the more familiar RGB. So (0, 0, 255) is pure red, not pure blue.
-    //
-    // The four-value version (BGRA) adds an Alpha channel:
-    //   A = 255 → fully opaque
-    //   A = 100 → semi-transparent (0x64 in hex = 100 in decimal)
-    //
-    // We have two versions of each colour because MP4 has no alpha channel
-    // (so we use BGR), while .mov files can carry BGRA with transparency.
     // ══════════════════════════════════════════════════════════════════════════
+    // COLOUR CONSTANTS
 
     private static readonly Scalar BlackBgr  = new(0,   0,   0);
     private static readonly Scalar BlackBgra = new(0,   0,   0,   255); // opaque black
@@ -417,7 +381,7 @@ public class BinaryClockReader
 
             // Try to detect the barcode rectangle, validating position first
             Rect? box = DetectBarcodeRect(cropped);
-            if (box.HasValue && IsValidPosition(box.Value, cropW, cropH))
+            if (box.HasValue)
             {
                 // Try to read the bit rows from the detected box
                 BinaryRows? rows = ReadBinaryRows(cropped, box.Value);
@@ -620,7 +584,7 @@ public class BinaryClockReader
                 // element elsewhere in the frame) we keep the last known good
                 // position rather than corrupting the cache with a false hit.
                 Rect? detected = DetectBarcodeRect(cropped);
-                if (detected.HasValue && IsValidPosition(detected.Value, cropW, cropH))
+                if (detected.HasValue)
                     boxRect = detected.Value;
 
                 // ── Step 3: Prepare the output frame ─────────────────────────
@@ -895,29 +859,6 @@ public class BinaryClockReader
         }
 
         return sb.ToString();
-    }
-
-    /// <summary>
-    /// Returns true if the detected rectangle is plausibly the barcode box —
-    /// i.e. its left edge is near the left of the crop and its top edge is
-    /// in the lower portion of the crop (since the box is always bottom-left).
-    ///
-    /// This prevents a wrong detection from corrupting the cache. Without this
-    /// guard, a false hit anywhere in the frame would overwrite the cached rect
-    /// and cause every subsequent cached frame to read bits from the wrong area.
-    /// </summary>
-    private bool IsValidPosition(Rect r, int frameW, int frameH)
-    {
-        // Left edge must be within the leftmost MaxLeftEdgeFraction of the crop.
-        // e.g. 0.15 × 384px = left edge must be ≤ 57px from the left.
-        double maxLeft = frameW * MaxLeftEdgeFraction;
-
-        // Top edge must be below MinTopEdgeFraction of the crop height.
-        // e.g. 0.4 × 216px = top edge must be ≥ 86px from the top of the crop
-        // (i.e. in the lower 60% of the crop, which is the bottom of the frame).
-        double minTop = frameH * MinTopEdgeFraction;
-
-        return r.X <= maxLeft && r.Y >= minTop;
     }
 
     /// <summary>
