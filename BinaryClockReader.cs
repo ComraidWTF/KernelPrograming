@@ -328,7 +328,7 @@ public class BinaryClockReader : IDisposable
         if (csvPath != null) Console.WriteLine($"CSV out     : {csvPath}");
         Console.WriteLine();
 
-        FourCC fourcc = wantAlpha ? FourCC.FromString("png ") : FourCC.MP4V;
+        FourCC fourcc = wantAlpha ? FourCC.FromString("png ") : FourCC.FromString("H264");
         using var writer = new VideoWriter(outputPath, fourcc, fps, new Size(cropW, cropH), isColor: true);
         if (!writer.IsOpened())
             throw new Exception("Cannot open VideoWriter. Check codec/path.");
