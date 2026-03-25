@@ -1,0 +1,103 @@
+private async void NavigateToPath(RadTreeListView treeListView, IList yourRootCollection, int[] path)
+{
+    if (path == null || path.Length == 0) return;
+
+    object current = null;
+    IList currentLevel = yourRootCollection;
+
+    foreach (int index in path)
+    {
+        if (index < 0 || index >= currentLevel.Count) return;
+
+        current = currentLevel[index];
+        treeListView.ExpandHierarchyItem(current);
+        await FlushDispatcher();
+
+        var childrenProp = current.GetType().GetProperty("YourChildrenPropertyName");
+        currentLevel = childrenProp?.GetValue(current) as IList;
+        if (currentLevel == null) break;
+    }
+
+    if (current == null) return;
+
+    treeListView.SelectedItem = current;
+
+    // First attempt: standard ScrollIntoView
+    treeListView.ScrollIntoView(current);
+    await FlushDispatcher();
+    treeListView.UpdateLayout();
+
+    // Second attempt: if container still null, force scroll via ScrollViewer
+    var row = await WaitForContainer(treeListView, current, maxRetries: 3);
+
+    if (row == null)
+    {
+        await ForceScrollToItem(treeListView, current);
+        row = await WaitForContainer(treeListView, current, maxRetries: 5);
+    }
+
+    row?.Focus();
+}
+
+private async Task ForceScrollToItem(RadTreeListView treeListView, object item)
+{
+    // Walk the visual tree to get the real ScrollViewer inside RadTreeListView
+    var scrollViewer = FindChildOfType<ScrollViewer>(treeListView);
+    if (scrollViewer == null) return;
+
+    // Get flat index of item among currently visible/generated items
+    int flatIndex = treeListView.Items.IndexOf(item);
+    if (flatIndex < 0) return;
+
+    // Estimate row height (Telerik default is 24px, adjust if yours differs)
+    double estimatedRowHeight = 24.0;
+    double targetOffset = flatIndex * estimatedRowHeight;
+
+    // Clamp to scrollable extent
+    targetOffset = Math.Min(targetOffset, scrollViewer.ScrollableHeight);
+
+    scrollViewer.ScrollToVerticalOffset(targetOffset);
+    await FlushDispatcher();
+    treeListView.UpdateLayout();
+
+    // Now nudge with ScrollIntoView once the viewport is in the right area
+    treeListView.ScrollIntoView(item);
+    await FlushDispatcher();
+    treeListView.UpdateLayout();
+}
+
+private async Task<GridViewRow> WaitForContainer(RadTreeListView tree, object item, int maxRetries = 5)
+{
+    for (int i = 0; i < maxRetries; i++)
+    {
+        var row = tree.ItemContainerGenerator.ContainerFromItem(item) as GridViewRow;
+        if (row != null) return row;
+
+        await FlushDispatcher();
+        tree.UpdateLayout();
+    }
+    return null;
+}
+
+private Task FlushDispatcher()
+{
+    var tcs = new TaskCompletionSource<bool>();
+    Application.Current.Dispatcher.BeginInvoke(
+        new Action(() => tcs.SetResult(true)),
+        DispatcherPriority.Loaded
+    );
+    return tcs.Task;
+}
+
+// Generic visual tree walker
+private static T FindChildOfType<T>(DependencyObject parent) where T : DependencyObject
+{
+    for (int i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+    {
+        var child = VisualTreeHelper.GetChild(parent, i);
+        if (child is T match) return match;
+        var result = FindChildOfType<T>(child);
+        if (result != null) return result;
+    }
+    return null;
+}
