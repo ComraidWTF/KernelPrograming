@@ -400,44 +400,119 @@ public class BinaryClockReader
         roi.SetTo(wantAlpha ? WhiteBgra : WhiteBgr, interiorLight);
     }
 
-    private (int[] row0, int[] row1) ExtractBits(Mat binary, int cols)
+    private (int[] row0, int[] row1) ExtractBits(Mat binary, int expectedCols)
     {
-        int w        = binary.Cols;
-        int h        = binary.Rows;
-        int rowH     = h / 2;
-        int colW     = w / cols;
-        int dataCols = cols - 1;
-        var row0     = new int[dataCols];
-        var row1     = new int[dataCols];
+        int w    = binary.Cols;
+        int h    = binary.Rows;
+        int rowH = h / 2;
+        int botH = h - rowH;
 
-        for (int c = 0; c < cols; c++)
+        // Step 1: Project the top half (row0 clock signal) into a 1D array.
+        // Each element is the mean brightness of that column across the top rows.
+        // Since row0 always alternates 0,1,0,1... this produces an alternating
+        // low/high waveform whose transitions mark the actual cell boundaries.
+        using var topHalf = new Mat(binary, new Rect(0, 0, w, rowH));
+        using var projMat = new Mat();
+        Cv2.Reduce(topHalf, projMat, ReduceDimension.Row, ReduceTypes.Avg, MatType.CV_32F);
+        projMat.GetArray(out float[] brightness);
+
+        // Step 2: Classify each column as light or dark by thresholding at the mean.
+        float mean = 0;
+        for (int x = 0; x < brightness.Length; x++) mean += brightness[x];
+        mean /= brightness.Length;
+
+        bool[] light = new bool[w];
+        for (int x = 0; x < w; x++) light[x] = brightness[x] > mean;
+
+        // Step 3: Find contiguous runs of the same classification.
+        // Each run corresponds to one cell (or a noise fragment to be merged).
+        var runs = new List<(int start, int end)>();
+        int runStart = 0;
+        for (int x = 1; x <= w; x++)
         {
-            int cellX = c * colW;
-            int cellW = (c == cols - 1) ? w - cellX : colW;
-
-            for (int r = 0; r < 2; r++)
+            if (x == w || light[x] != light[runStart])
             {
-                int cellY = r * rowH;
-                int cellH = (r == 1) ? h - cellY : rowH;
-                int padX  = (int)(cellW * (1 - SampleFraction) / 2);
-                int padY  = (int)(cellH * (1 - SampleFraction) / 2);
-
-                var sampleRect = ClampRect(
-                    new Rect(cellX + padX, cellY + padY,
-                             Math.Max(1, cellW - padX * 2),
-                             Math.Max(1, cellH - padY * 2)),
-                    binary.Cols, binary.Rows);
-
-                using var cell = new Mat(binary, sampleRect);
-                int bit = (Cv2.Mean(cell).Val0 / 255.0) >= WhiteVoteThreshold ? 1 : 0;
-
-                if (c == 0) continue;
-                if (r == 0) row0[c - 1] = bit;
-                else        row1[c - 1] = bit;
+                runs.Add((runStart, x - 1));
+                runStart = x;
             }
         }
 
-        return (row0, row1);
+        // Step 4: Merge tiny noise runs caused by H.264 compression artifacts.
+        // A real cell is at least (totalWidth / (expectedCols * 4)) pixels wide.
+        // Anything smaller is noise — absorb it into its smallest neighbour.
+        int minWidth = Math.Max(2, w / (expectedCols * 4));
+        bool merged  = true;
+        while (merged && runs.Count > 1)
+        {
+            merged = false;
+            for (int i = 0; i < runs.Count; i++)
+            {
+                if ((runs[i].end - runs[i].start + 1) >= minWidth) continue;
+
+                int mergeWith;
+                if      (i == 0)             mergeWith = 1;
+                else if (i == runs.Count - 1) mergeWith = i - 1;
+                else
+                {
+                    int leftW  = runs[i - 1].end - runs[i - 1].start + 1;
+                    int rightW = runs[i + 1].end - runs[i + 1].start + 1;
+                    mergeWith  = leftW <= rightW ? i - 1 : i + 1;
+                }
+
+                int lo = Math.Min(i, mergeWith);
+                int hi = Math.Max(i, mergeWith);
+                runs[lo] = (Math.Min(runs[lo].start, runs[hi].start),
+                             Math.Max(runs[lo].end,   runs[hi].end));
+                runs.RemoveAt(hi);
+                merged = true;
+                break;
+            }
+        }
+
+        // Step 5: If compression merged two cells into one wide run we end up with
+        // fewer runs than expected. If noise split one cell into two we have more.
+        // Trim excess by merging the two adjacent narrowest runs until count matches.
+        while (runs.Count > expectedCols)
+        {
+            int bestIdx      = 0;
+            int bestCombined = int.MaxValue;
+            for (int i = 0; i < runs.Count - 1; i++)
+            {
+                int combined = (runs[i].end - runs[i].start) + (runs[i + 1].end - runs[i + 1].start);
+                if (combined < bestCombined) { bestCombined = combined; bestIdx = i; }
+            }
+            runs[bestIdx] = (runs[bestIdx].start, runs[bestIdx + 1].end);
+            runs.RemoveAt(bestIdx + 1);
+        }
+
+        // Step 6: Skip run 0 (sync square) and sample both rows using the
+        // exact column boundaries derived from the row0 clock signal.
+        int dataCols = runs.Count - 1;
+        var row0Data = new int[dataCols];
+        var row1Data = new int[dataCols];
+
+        for (int i = 1; i < runs.Count; i++)
+        {
+            var (cs, ce) = runs[i];
+            int cw   = ce - cs + 1;
+            int padX = (int)(cw * (1 - SampleFraction) / 2);
+            int sx   = cs + padX;
+            int sw   = Math.Max(1, cw - padX * 2);
+
+            // Sample top row (row0)
+            int topPad = (int)(rowH * (1 - SampleFraction) / 2);
+            var topRect = ClampRect(new Rect(sx, topPad, sw, Math.Max(1, rowH - topPad * 2)), w, h);
+            using var topCell = new Mat(binary, topRect);
+            row0Data[i - 1] = (Cv2.Mean(topCell).Val0 / 255.0) >= WhiteVoteThreshold ? 1 : 0;
+
+            // Sample bottom row (row1) using the same column range
+            int botPad = (int)(botH * (1 - SampleFraction) / 2);
+            var botRect = ClampRect(new Rect(sx, rowH + botPad, sw, Math.Max(1, botH - botPad * 2)), w, h);
+            using var botCell = new Mat(binary, botRect);
+            row1Data[i - 1] = (Cv2.Mean(botCell).Val0 / 255.0) >= WhiteVoteThreshold ? 1 : 0;
+        }
+
+        return (row0Data, row1Data);
     }
 
     private static int DetectColumnCount(Mat binary)
