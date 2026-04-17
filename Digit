@@ -1,0 +1,11 @@
+var nonDigits = input.Where(c => !char.IsDigit(c)).Distinct().ToArray();
+
+// If there's more than one, ignore space — it's padding
+var delimiters = nonDigits.Length > 1
+    ? nonDigits.Where(c => c != ' ').ToArray()
+    : nonDigits;
+
+if (delimiters.Length > 1)
+    throw new FormatException("Multiple delimiters found.");
+
+char delimiter = delimiters.FirstOrDefault();
