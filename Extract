@@ -1,0 +1,4 @@
+var ids = lines.Select(l => Regex.Match(l, @"/Id/(\d+)"))
+               .Where(m => m.Success)
+               .Select(m => m.Groups[1].Value)
+               .ToList();
