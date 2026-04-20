@@ -19,8 +19,6 @@ public static class ChartExcelExporter
         public double? Min { get; set; }
         /// <summary>Inclusive axis maximum. Null = let Excel auto-scale.</summary>
         public double? Max { get; set; }
-        /// <summary>Spacing between major ticks. Null = auto.</summary>
-        public double? MajorUnit { get; set; }
         /// <summary>
         /// Optional mapping of tick value → display name.
         /// Written to a key table beside the chart (the chart itself shows numbers).
@@ -159,10 +157,9 @@ public static class ChartExcelExporter
         if (cfg.Min.HasValue) axis.Min = cfg.Min.Value;
         if (cfg.Max.HasValue) axis.Max = cfg.Max.Value;
 
-        // MajorUnit / MinorUnit naming can vary slightly between Telerik versions.
-        // If your IntelliSense shows a different property name (e.g. MajorStep),
-        // swap these two lines accordingly.
-        if (cfg.MajorUnit.HasValue) axis.MajorUnit = cfg.MajorUnit.Value;
+        // Note: Telerik's ValueAxis doesn't expose a MajorUnit/MajorStep property
+        // for tick spacing. Excel auto-picks the tick interval from Min/Max; for
+        // integer ranges like 0..5 or 0..9 it almost always lands on unit ticks.
     }
 
     private static void WriteLabelKey(
