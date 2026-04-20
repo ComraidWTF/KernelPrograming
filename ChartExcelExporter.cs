@@ -14,21 +14,23 @@ using Telerik.Windows.Documents.Spreadsheet.Model.Charts;
 public static class ChartExcelExporter
 {
     /// <summary>
-    /// Exports LiveCharts2 line series to an .xlsx with a native Excel line chart.
-    /// Series share the X axis — X values are taken from the first series.
+    /// Exports LiveCharts2 line series to an .xlsx with a native Excel scatter
+    /// chart. Uses a true numeric X axis so fractional X values (e.g. 0.33, 1)
+    /// plot proportionally, matching what LiveCharts2 shows on screen.
+    /// Each series writes its own X and Y columns so different series may have
+    /// different X values and different point counts.
     /// </summary>
     public static void ExportLineChart<TPoint>(
         CartesianChart chart,
         string filePath,
-        Func<TPoint, object> xSelector,
-        Func<TPoint, double> ySelector,
-        IList<string> xAxisLabels = null)
+        Func<TPoint, double> xSelector,
+        Func<TPoint, double> ySelector)
     {
         if (chart is null) throw new ArgumentNullException(nameof(chart));
         if (xSelector is null) throw new ArgumentNullException(nameof(xSelector));
         if (ySelector is null) throw new ArgumentNullException(nameof(ySelector));
 
-        // 1. Collect the LC2 line series we care about
+        // 1. Pull the LC2 line series we care about
         var lc2 = chart.Series
             .OfType<ISeries>()
             .Where(s => s.GetType().Name.StartsWith("LineSeries"))
@@ -43,111 +45,95 @@ public static class ChartExcelExporter
 
         if (lc2.Count == 0) return;
 
-        int rowCount = lc2[0].Points.Count;
-        var xValues = lc2[0].Points.Select(p => xSelector(p)).ToList();
-
-        // 2. Create workbook and lay out the data
         var workbook = new Workbook();
         var sheet = workbook.Worksheets.Add();
         sheet.Name = "Chart Data";
 
-        // Header row
-        sheet.Cells[0, 0].SetValue("X");
+        // 2. Layout: per-series X/Y column pairs
+        //    For series i: col 2i = "<Name> X", col 2i+1 = "<Name> Y"
+        int maxRows = lc2.Max(s => s.Points.Count);
+
         for (int i = 0; i < lc2.Count; i++)
-            sheet.Cells[0, i + 1].SetValue(lc2[i].Name);
-
-        // X column + Y columns
-        for (int row = 0; row < rowCount; row++)
         {
-            // If labels are provided, column A holds the display label for this
-            // step (e.g. "Jan", "Feb"...) — the Excel Line chart will use these
-            // directly as X-axis tick labels. Otherwise fall back to the raw X value.
-            if (xAxisLabels != null && row < xAxisLabels.Count)
-                sheet.Cells[row + 1, 0].SetValue(xAxisLabels[row] ?? string.Empty);
-            else
-                WriteX(sheet.Cells[row + 1, 0], xValues[row]);
+            int xCol = 2 * i;
+            int yCol = 2 * i + 1;
 
-            for (int col = 0; col < lc2.Count; col++)
+            sheet.Cells[0, xCol].SetValue($"{lc2[i].Name} X");
+            sheet.Cells[0, yCol].SetValue($"{lc2[i].Name} Y");
+
+            var pts = lc2[i].Points;
+            for (int r = 0; r < pts.Count; r++)
             {
-                var pts = lc2[col].Points;
-                if (row < pts.Count)
-                {
-                    double y = ySelector(pts[row]);
-                    if (!double.IsNaN(y)) sheet.Cells[row + 1, col + 1].SetValue(y);
-                }
+                double x = xSelector(pts[r]);
+                double y = ySelector(pts[r]);
+                if (!double.IsNaN(x)) sheet.Cells[r + 1, xCol].SetValue(x);
+                if (!double.IsNaN(y)) sheet.Cells[r + 1, yCol].SetValue(y);
             }
         }
 
-        // 3. Create the FloatingChartShape. The CellRange passed here seeds an
-        //    auto-generated chart which we will then completely replace with
-        //    our own explicit series, so its exact contents don't matter.
-        var seedRange = new CellRange(0, 0, rowCount, lc2.Count);
+        // 3. Seed a Scatter chart. We'll overwrite its series.
+        int totalCols = 2 * lc2.Count;
+        var seedRange = new CellRange(0, 0, maxRows, totalCols - 1);
+
         var chartShape = new FloatingChartShape(
             sheet,
-            new CellIndex(rowCount + 3, 0),
+            new CellIndex(maxRows + 3, 0),
             seedRange,
-            ChartType.Line)
+            ChartType.Scatter)
         {
-            Width = 600,
-            Height = 320
+            Width = 650,
+            Height = 350
         };
 
-        // 4. Get the line series group that was created for us, and CLEAR its
-        //    auto-generated series so we can add ours explicitly.
-        var group = chartShape.Chart.SeriesGroups.First();
+        // 4. Clear auto-generated series and rebuild each one with explicit
+        //    X and Y ranges + a text title for the legend.
+        var group = (ScatterSeriesGroup)chartShape.Chart.SeriesGroups.First();
         while (group.Series.Count > 0)
             group.Series.Remove(group.Series.First());
 
-        // 5. Shared X-axis categories = column A, rows 1..rowCount (A2:A{n+1})
-        var categoriesRange = new CellRange(1, 0, rowCount, 0);
-        var categoriesData = new WorkbookFormulaChartData(sheet, categoriesRange);
-
-        // 6. Add each series explicitly with its own Values range and a
-        //    TextTitle so the legend entry is correct.
         for (int i = 0; i < lc2.Count; i++)
         {
-            var valuesRange = new CellRange(1, i + 1, rowCount, i + 1);
-            var valuesData = new WorkbookFormulaChartData(sheet, valuesRange);
+            int xCol = 2 * i;
+            int yCol = 2 * i + 1;
+            int lastRow = lc2[i].Points.Count; // inclusive
 
-            Title seriesTitle = new TextTitle(lc2[i].Name);
-            var added = group.Series.Add(categoriesData, valuesData, seriesTitle);
+            var xRange = new CellRange(1, xCol, lastRow, xCol);
+            var yRange = new CellRange(1, yCol, lastRow, yCol);
 
-            // Match LiveCharts2 stroke color
+            var xData = new WorkbookFormulaChartData(sheet, xRange);
+            var yData = new WorkbookFormulaChartData(sheet, yRange);
+
+            // Add via SeriesCollection.Add — in a ScatterSeriesGroup this
+            // creates a ScatterSeries where the first IChartData is the
+            // X values and the second is the Y values.
+            Title title = new TextTitle(lc2[i].Name);
+            var added = group.Series.Add(xData, yData, title);
+
+            // Color the line + marker
             if (lc2[i].Color is Color c)
             {
                 added.Outline.Fill = new SolidFill(c);
                 added.Outline.Width = 2;
+
+                if (added is ScatterSeries scatter && scatter.Marker != null)
+                {
+                    scatter.Marker.Fill = new SolidFill(c);
+                }
             }
         }
 
-        // 7. Chart title + legend
+        // 5. Chart title + legend
         chartShape.Chart.Title = new TextTitle("Exported Chart");
         chartShape.Chart.Legend = new Legend { LegendPosition = LegendPosition.Right };
 
         sheet.Charts.Add(chartShape);
 
-        // 8. Tidy up and save
+        // 6. Save
         sheet.Columns[sheet.UsedCellRange].AutoFitWidth();
 
         var provider = new XlsxFormatProvider();
         using var stream = File.Create(filePath);
         provider.Export(workbook, stream, TimeSpan.FromSeconds(30));
-    }
-
-    private static void WriteX(CellSelection cell, object x)
-    {
-        switch (x)
-        {
-            case null:        cell.SetValue(string.Empty); break;
-            case double d:    cell.SetValue(d); break;
-            case float f:     cell.SetValue(f); break;
-            case int i:       cell.SetValue(i); break;
-            case long l:      cell.SetValue((double)l); break;
-            case decimal m:   cell.SetValue((double)m); break;
-            case DateTime dt: cell.SetValue(dt); break;
-            case string s:    cell.SetValue(s); break;
-            default:          cell.SetValue(x.ToString()); break;
-        }
     }
 
     private static Color? GetStrokeColor(ISeries series)
