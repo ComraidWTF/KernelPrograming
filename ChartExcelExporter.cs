@@ -13,24 +13,36 @@ using Telerik.Windows.Documents.Spreadsheet.Model.Charts;
 
 public static class ChartExcelExporter
 {
-    /// <summary>
-    /// Exports LiveCharts2 line series to an .xlsx with a native Excel scatter
-    /// chart. Uses a true numeric X axis so fractional X values (e.g. 0.33, 1)
-    /// plot proportionally, matching what LiveCharts2 shows on screen.
-    /// Each series writes its own X and Y columns so different series may have
-    /// different X values and different point counts.
-    /// </summary>
+    public sealed class AxisConfig
+    {
+        /// <summary>Inclusive axis minimum. Null = let Excel auto-scale.</summary>
+        public double? Min { get; set; }
+        /// <summary>Inclusive axis maximum. Null = let Excel auto-scale.</summary>
+        public double? Max { get; set; }
+        /// <summary>Spacing between major ticks. Null = auto.</summary>
+        public double? MajorUnit { get; set; }
+        /// <summary>
+        /// Optional mapping of tick value → display name.
+        /// Written to a key table beside the chart (the chart itself shows numbers).
+        /// </summary>
+        public IDictionary<double, string> Labels { get; set; }
+        /// <summary>Header used above the labels column in the key table.</summary>
+        public string Title { get; set; }
+    }
+
     public static void ExportLineChart<TPoint>(
         CartesianChart chart,
         string filePath,
         Func<TPoint, double> xSelector,
-        Func<TPoint, double> ySelector)
+        Func<TPoint, double> ySelector,
+        AxisConfig xAxis = null,
+        AxisConfig yAxis = null)
     {
         if (chart is null) throw new ArgumentNullException(nameof(chart));
         if (xSelector is null) throw new ArgumentNullException(nameof(xSelector));
         if (ySelector is null) throw new ArgumentNullException(nameof(ySelector));
 
-        // 1. Pull the LC2 line series we care about
+        // 1. Pull LC2 line series
         var lc2 = chart.Series
             .OfType<ISeries>()
             .Where(s => s.GetType().Name.StartsWith("LineSeries"))
@@ -49,10 +61,9 @@ public static class ChartExcelExporter
         var sheet = workbook.Worksheets.Add();
         sheet.Name = "Chart Data";
 
-        // 2. Layout: per-series X/Y column pairs
-        //    For series i: col 2i = "<Name> X", col 2i+1 = "<Name> Y"
         int maxRows = lc2.Max(s => s.Points.Count);
 
+        // 2. Lay out per-series X/Y column pairs
         for (int i = 0; i < lc2.Count; i++)
         {
             int xCol = 2 * i;
@@ -71,10 +82,10 @@ public static class ChartExcelExporter
             }
         }
 
-        // 3. Seed a Scatter chart. We'll overwrite its series.
         int totalCols = 2 * lc2.Count;
-        var seedRange = new CellRange(0, 0, maxRows, totalCols - 1);
 
+        // 3. Seed the Scatter chart (we'll overwrite its series)
+        var seedRange = new CellRange(0, 0, maxRows, totalCols - 1);
         var chartShape = new FloatingChartShape(
             sheet,
             new CellIndex(maxRows + 3, 0),
@@ -85,8 +96,7 @@ public static class ChartExcelExporter
             Height = 350
         };
 
-        // 4. Clear auto-generated series and rebuild each one with explicit
-        //    X and Y ranges + a text title for the legend.
+        // 4. Rebuild series explicitly
         var group = (ScatterSeriesGroup)chartShape.Chart.SeriesGroups.First();
         while (group.Series.Count > 0)
             group.Series.Remove(group.Series.First());
@@ -95,7 +105,7 @@ public static class ChartExcelExporter
         {
             int xCol = 2 * i;
             int yCol = 2 * i + 1;
-            int lastRow = lc2[i].Points.Count; // inclusive
+            int lastRow = lc2[i].Points.Count;
 
             var xRange = new CellRange(1, xCol, lastRow, xCol);
             var yRange = new CellRange(1, yCol, lastRow, yCol);
@@ -103,13 +113,9 @@ public static class ChartExcelExporter
             var xData = new WorkbookFormulaChartData(sheet, xRange);
             var yData = new WorkbookFormulaChartData(sheet, yRange);
 
-            // Add via SeriesCollection.Add — in a ScatterSeriesGroup this
-            // creates a ScatterSeries where the first IChartData is the
-            // X values and the second is the Y values.
             Title title = new TextTitle(lc2[i].Name);
             var added = group.Series.Add(xData, yData, title);
 
-            // Color the line + marker
             if (lc2[i].Color is Color c)
             {
                 added.Outline.Fill = new SolidFill(c);
@@ -122,18 +128,61 @@ public static class ChartExcelExporter
             }
         }
 
-        // 5. Chart title + legend
+        // 5. Axis configuration — major ticks at integer positions, no minor
+        ApplyAxisConfig(chartShape.Chart.PrimaryAxes.CategoryAxis as ValueAxis, xAxis);
+        ApplyAxisConfig(chartShape.Chart.PrimaryAxes.ValueAxis, yAxis);
+
         chartShape.Chart.Title = new TextTitle("Exported Chart");
         chartShape.Chart.Legend = new Legend { LegendPosition = LegendPosition.Right };
 
         sheet.Charts.Add(chartShape);
 
-        // 6. Save
+        // 6. Label key table — placed to the right of the chart area so it sits
+        //    alongside the chart visually, readable without zooming in.
+        int keyStartRow = maxRows + 3;
+        int keyStartCol = totalCols + 1; // one blank column for spacing
+
+        WriteLabelKey(sheet, keyStartRow, keyStartCol, xAxis, "X Axis");
+        WriteLabelKey(sheet, keyStartRow, keyStartCol + 3, yAxis, "Y Axis");
+
         sheet.Columns[sheet.UsedCellRange].AutoFitWidth();
 
         var provider = new XlsxFormatProvider();
         using var stream = File.Create(filePath);
         provider.Export(workbook, stream, TimeSpan.FromSeconds(30));
+    }
+
+    private static void ApplyAxisConfig(ValueAxis axis, AxisConfig cfg)
+    {
+        if (axis == null || cfg == null) return;
+
+        if (cfg.Min.HasValue) axis.Min = cfg.Min.Value;
+        if (cfg.Max.HasValue) axis.Max = cfg.Max.Value;
+
+        // MajorUnit / MinorUnit naming can vary slightly between Telerik versions.
+        // If your IntelliSense shows a different property name (e.g. MajorStep),
+        // swap these two lines accordingly.
+        if (cfg.MajorUnit.HasValue) axis.MajorUnit = cfg.MajorUnit.Value;
+    }
+
+    private static void WriteLabelKey(
+        Worksheet sheet, int startRow, int startCol,
+        AxisConfig cfg, string defaultHeader)
+    {
+        if (cfg?.Labels == null || cfg.Labels.Count == 0) return;
+
+        string header = string.IsNullOrWhiteSpace(cfg.Title) ? defaultHeader : cfg.Title;
+
+        sheet.Cells[startRow, startCol].SetValue(header);
+        sheet.Cells[startRow, startCol + 1].SetValue("Label");
+
+        int row = startRow + 1;
+        foreach (var kvp in cfg.Labels.OrderBy(k => k.Key))
+        {
+            sheet.Cells[row, startCol].SetValue(kvp.Key);
+            sheet.Cells[row, startCol + 1].SetValue(kvp.Value ?? string.Empty);
+            row++;
+        }
     }
 
     private static Color? GetStrokeColor(ISeries series)
