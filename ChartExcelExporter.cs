@@ -15,32 +15,40 @@ public static class ChartExcelExporter
 {
     public sealed class AxisConfig
     {
-        /// <summary>Inclusive axis minimum. Null = let Excel auto-scale.</summary>
         public double? Min { get; set; }
-        /// <summary>Inclusive axis maximum. Null = let Excel auto-scale.</summary>
         public double? Max { get; set; }
+        /// <summary>Shown as chart axis title AND key-table header.</summary>
+        public string Title { get; set; }
         /// <summary>
-        /// Optional mapping of tick value → display name.
-        /// Written to a key table beside the chart (the chart itself shows numbers).
+        /// Optional tick-value -> display-name map, written to a key table
+        /// beside the chart. The chart axis itself stays numeric.
         /// </summary>
         public IDictionary<double, string> Labels { get; set; }
-        /// <summary>Header used above the labels column in the key table.</summary>
-        public string Title { get; set; }
     }
 
+    /// <summary>
+    /// Exports LiveCharts2 line series into an .xlsx with data + a native
+    /// Excel scatter chart. Pure Telerik RadSpreadProcessing.
+    ///
+    /// labelSelector, if provided, writes a "&lt;Series&gt; Label" column per series
+    /// so the text exists in the workbook. Making those appear ON the chart
+    /// requires a one-time Excel click per series
+    /// (Add Data Labels -> Value From Cells -> pick the Label column), because
+    /// Telerik's ScatterSeries in this version does not expose a DataLabels API.
+    /// </summary>
     public static void ExportLineChart<TPoint>(
         CartesianChart chart,
         string filePath,
         Func<TPoint, double> xSelector,
         Func<TPoint, double> ySelector,
         AxisConfig xAxis = null,
-        AxisConfig yAxis = null)
+        AxisConfig yAxis = null,
+        Func<TPoint, string> labelSelector = null)
     {
         if (chart is null) throw new ArgumentNullException(nameof(chart));
         if (xSelector is null) throw new ArgumentNullException(nameof(xSelector));
         if (ySelector is null) throw new ArgumentNullException(nameof(ySelector));
 
-        // 1. Pull LC2 line series
         var lc2 = chart.Series
             .OfType<ISeries>()
             .Where(s => s.GetType().Name.StartsWith("LineSeries"))
@@ -59,16 +67,20 @@ public static class ChartExcelExporter
         var sheet = workbook.Worksheets.Add();
         sheet.Name = "Chart Data";
 
+        bool hasLabels = labelSelector != null;
+        int colsPerSeries = hasLabels ? 3 : 2;
         int maxRows = lc2.Max(s => s.Points.Count);
 
-        // 2. Lay out per-series X/Y column pairs
+        // 1. Lay out data: X, Y, (optional Label) per series
         for (int i = 0; i < lc2.Count; i++)
         {
-            int xCol = 2 * i;
-            int yCol = 2 * i + 1;
+            int xCol = colsPerSeries * i;
+            int yCol = xCol + 1;
+            int labelCol = xCol + 2;
 
             sheet.Cells[0, xCol].SetValue($"{lc2[i].Name} X");
             sheet.Cells[0, yCol].SetValue($"{lc2[i].Name} Y");
+            if (hasLabels) sheet.Cells[0, labelCol].SetValue($"{lc2[i].Name} Label");
 
             var pts = lc2[i].Points;
             for (int r = 0; r < pts.Count; r++)
@@ -77,12 +89,14 @@ public static class ChartExcelExporter
                 double y = ySelector(pts[r]);
                 if (!double.IsNaN(x)) sheet.Cells[r + 1, xCol].SetValue(x);
                 if (!double.IsNaN(y)) sheet.Cells[r + 1, yCol].SetValue(y);
+                if (hasLabels)
+                    sheet.Cells[r + 1, labelCol].SetValue(labelSelector(pts[r]) ?? string.Empty);
             }
         }
 
-        int totalCols = 2 * lc2.Count;
+        int totalCols = colsPerSeries * lc2.Count;
 
-        // 3. Seed the Scatter chart (we'll overwrite its series)
+        // 2. Scatter chart seeded with a range; we replace its series below
         var seedRange = new CellRange(0, 0, maxRows, totalCols - 1);
         var chartShape = new FloatingChartShape(
             sheet,
@@ -94,22 +108,19 @@ public static class ChartExcelExporter
             Height = 350
         };
 
-        // 4. Rebuild series explicitly
+        // 3. Rebuild series explicitly so legend + X/Y bindings are correct
         var group = (ScatterSeriesGroup)chartShape.Chart.SeriesGroups.First();
         while (group.Series.Count > 0)
             group.Series.Remove(group.Series.First());
 
         for (int i = 0; i < lc2.Count; i++)
         {
-            int xCol = 2 * i;
-            int yCol = 2 * i + 1;
+            int xCol = colsPerSeries * i;
+            int yCol = xCol + 1;
             int lastRow = lc2[i].Points.Count;
 
-            var xRange = new CellRange(1, xCol, lastRow, xCol);
-            var yRange = new CellRange(1, yCol, lastRow, yCol);
-
-            var xData = new WorkbookFormulaChartData(sheet, xRange);
-            var yData = new WorkbookFormulaChartData(sheet, yRange);
+            var xData = new WorkbookFormulaChartData(sheet, new CellRange(1, xCol, lastRow, xCol));
+            var yData = new WorkbookFormulaChartData(sheet, new CellRange(1, yCol, lastRow, yCol));
 
             Title title = new TextTitle(lc2[i].Name);
             var added = group.Series.Add(xData, yData, title);
@@ -118,15 +129,12 @@ public static class ChartExcelExporter
             {
                 added.Outline.Fill = new SolidFill(c);
                 added.Outline.Width = 2;
-
                 if (added is ScatterSeries scatter && scatter.Marker != null)
-                {
                     scatter.Marker.Fill = new SolidFill(c);
-                }
             }
         }
 
-        // 5. Axis configuration — major ticks at integer positions, no minor
+        // 4. Axis config
         ApplyAxisConfig(chartShape.Chart.PrimaryAxes.CategoryAxis as ValueAxis, xAxis);
         ApplyAxisConfig(chartShape.Chart.PrimaryAxes.ValueAxis, yAxis);
 
@@ -135,16 +143,15 @@ public static class ChartExcelExporter
 
         sheet.Charts.Add(chartShape);
 
-        // 6. Label key table — placed to the right of the chart area so it sits
-        //    alongside the chart visually, readable without zooming in.
+        // 5. Axis label key tables next to the chart
         int keyStartRow = maxRows + 3;
-        int keyStartCol = totalCols + 1; // one blank column for spacing
-
+        int keyStartCol = totalCols + 1;
         WriteLabelKey(sheet, keyStartRow, keyStartCol, xAxis, "X Axis");
         WriteLabelKey(sheet, keyStartRow, keyStartCol + 3, yAxis, "Y Axis");
 
         sheet.Columns[sheet.UsedCellRange].AutoFitWidth();
 
+        // 6. Save — pure Telerik
         var provider = new XlsxFormatProvider();
         using var stream = File.Create(filePath);
         provider.Export(workbook, stream, TimeSpan.FromSeconds(30));
@@ -157,9 +164,8 @@ public static class ChartExcelExporter
         if (cfg.Min.HasValue) axis.Min = cfg.Min.Value;
         if (cfg.Max.HasValue) axis.Max = cfg.Max.Value;
 
-        // Note: Telerik's ValueAxis doesn't expose a MajorUnit/MajorStep property
-        // for tick spacing. Excel auto-picks the tick interval from Min/Max; for
-        // integer ranges like 0..5 or 0..9 it almost always lands on unit ticks.
+        if (!string.IsNullOrWhiteSpace(cfg.Title))
+            axis.Title = new TextTitle(cfg.Title);
     }
 
     private static void WriteLabelKey(
@@ -169,7 +175,6 @@ public static class ChartExcelExporter
         if (cfg?.Labels == null || cfg.Labels.Count == 0) return;
 
         string header = string.IsNullOrWhiteSpace(cfg.Title) ? defaultHeader : cfg.Title;
-
         sheet.Cells[startRow, startCol].SetValue(header);
         sheet.Cells[startRow, startCol + 1].SetValue("Label");
 
