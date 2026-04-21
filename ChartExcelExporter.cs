@@ -261,7 +261,7 @@ public static class ChartExcelExporter
 
             dLbls.Append(new C.DataLabel(
                 new C.Index { Val = (uint)i },
-                new C.Tx(new C.StringReference(
+                new C.ChartText(new C.StringReference(
                     new C.Formula($"'{sheet}'!${ColLetter(labelCol)}${row}"),
                     cache)),
                 new C.ShowLegendKey { Val = false },
