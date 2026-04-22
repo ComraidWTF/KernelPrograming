@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using LiveChartsCore.Measure;
+using System.Reflection;
 using LiveChartsCore.SkiaSharpView;
 using SkiaSharp;
 using Telerik.Windows.Documents.Spreadsheet.Model;
@@ -25,6 +25,8 @@ namespace WpfChartExcelExport
             int startColumn = 0,
             bool includeXLabelColumn = true,
             bool includeXLookupTable = false,
+            bool showDataLabels = false,
+            bool labelLastPointOnly = true,
             IComparer<double>? xComparer = null)
         {
             if (worksheet == null) throw new ArgumentNullException(nameof(worksheet));
@@ -100,7 +102,9 @@ namespace WpfChartExcelExport
                 startColumn,
                 chartTitle,
                 xAxisTitle,
-                yAxisTitle);
+                yAxisTitle,
+                showDataLabels,
+                labelLastPointOnly);
 
             if (includeXLookupTable)
             {
@@ -122,6 +126,8 @@ namespace WpfChartExcelExport
             int startColumn = 0,
             bool includeXLabelColumn = true,
             bool includeXLookupTable = false,
+            bool showDataLabels = false,
+            bool labelLastPointOnly = true,
             IComparer<double>? xComparer = null)
         {
             if (series == null) throw new ArgumentNullException(nameof(series));
@@ -139,6 +145,8 @@ namespace WpfChartExcelExport
                 startColumn,
                 includeXLabelColumn,
                 includeXLookupTable,
+                showDataLabels,
+                labelLastPointOnly,
                 xComparer);
         }
 
@@ -307,7 +315,9 @@ namespace WpfChartExcelExport
             int chartColumn,
             string? chartTitle,
             string? xAxisTitle,
-            string? yAxisTitle)
+            string? yAxisTitle,
+            bool showDataLabels,
+            bool labelLastPointOnly)
         {
             var seedRange = new CellRange(dataRow, xValueColumn, lastRow, firstSeriesColumn);
 
@@ -317,8 +327,8 @@ namespace WpfChartExcelExport
                 seedRange,
                 ChartType.Scatter)
             {
-                Width = 900,
-                Height = 500
+                Width = 1100,
+                Height = 620
             };
 
             var chart = chartShape.Chart;
@@ -333,16 +343,8 @@ namespace WpfChartExcelExport
                 chart.Title = new TextTitle(chartTitle);
             }
 
-            // If your Telerik package exposes axis titles on a different member, only this block should need adjustment.
-            if (!string.IsNullOrWhiteSpace(xAxisTitle))
-            {
-                chart.PrimaryAxes.CategoryAxis.Title = new TextTitle(xAxisTitle);
-            }
-
-            if (!string.IsNullOrWhiteSpace(yAxisTitle))
-            {
-                chart.PrimaryAxes.ValueAxis.Title = new TextTitle(yAxisTitle);
-            }
+            TrySetAxisTitle(chart, xAxisTitle, isX: true);
+            TrySetAxisTitle(chart, yAxisTitle, isX: false);
 
             var group = chart.SeriesGroups.First();
 
@@ -368,27 +370,168 @@ namespace WpfChartExcelExport
                     yValues,
                     new TextTitle(mapped[i].Name));
 
-                try
+                TryApplySeriesStyle(added, mapped[i].Color);
+                TryConfigureScatterSeries(added);
+                if (showDataLabels)
                 {
-                    if (added is ScatterSeries scatterSeries)
-                    {
-                        scatterSeries.Outline.Fill = new SolidFill(HexToThemableColor(mapped[i].Color));
-                    }
-                    else if (added is Telerik.Windows.Documents.Spreadsheet.Model.Charts.LineSeries lineSeries)
-                    {
-                        lineSeries.Outline.Fill = new SolidFill(HexToThemableColor(mapped[i].Color));
-                    }
-                    else if (added is CategorySeriesBase categorySeries)
-                    {
-                        categorySeries.Outline.Fill = new SolidFill(HexToThemableColor(mapped[i].Color));
-                    }
-                }
-                catch
-                {
+                    TryConfigureDataLabels(
+                        added,
+                        positionName: "Above",
+                        showSeriesName: false,
+                        showValue: !labelLastPointOnly,
+                        showCategoryName: false);
                 }
             }
 
             worksheet.Charts.Add(chartShape);
+        }
+
+        private static void TrySetAxisTitle(object chart, string? title, bool isX)
+        {
+            if (string.IsNullOrWhiteSpace(title) || chart == null) return;
+
+            try
+            {
+                var chartType = chart.GetType();
+                var primaryAxesProp = chartType.GetProperty("PrimaryAxes");
+                if (primaryAxesProp == null) return;
+
+                var primaryAxes = primaryAxesProp.GetValue(chart);
+                if (primaryAxes == null) return;
+
+                var axesType = primaryAxes.GetType();
+                var axisProp = axesType.GetProperty(isX ? "CategoryAxis" : "ValueAxis");
+                if (axisProp == null) return;
+
+                var axis = axisProp.GetValue(primaryAxes);
+                if (axis == null) return;
+
+                var titleProp = axis.GetType().GetProperty("Title");
+                if (titleProp == null || !titleProp.CanWrite) return;
+
+                titleProp.SetValue(axis, new TextTitle(title));
+            }
+            catch
+            {
+            }
+        }
+
+        private static void TryApplySeriesStyle(object series, string hexColor)
+        {
+            try
+            {
+                var fill = new SolidFill(HexToThemableColor(hexColor));
+
+                if (series is ScatterSeries scatterSeries)
+                {
+                    scatterSeries.Outline.Fill = fill;
+                    return;
+                }
+
+                if (series is Telerik.Windows.Documents.Spreadsheet.Model.Charts.LineSeries lineSeries)
+                {
+                    lineSeries.Outline.Fill = fill;
+                    return;
+                }
+
+                if (series is CategorySeriesBase categorySeries)
+                {
+                    categorySeries.Outline.Fill = fill;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void TryConfigureScatterSeries(object series)
+        {
+            try
+            {
+                if (series is ScatterSeries scatterSeries)
+                {
+                    scatterSeries.ScatterStyle = ScatterStyle.LineMarker;
+                    scatterSeries.Marker = new Marker
+                    {
+                        Size = 8,
+                        Symbol = MarkerStyle.Circle
+                    };
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static void TryConfigureDataLabels(
+            object series,
+            string positionName = "Above",
+            bool showSeriesName = false,
+            bool showValue = true,
+            bool showCategoryName = false)
+        {
+            if (series == null) return;
+
+            try
+            {
+                var seriesType = series.GetType();
+                var dataLabelsProp = seriesType.GetProperty("DataLabels");
+                if (dataLabelsProp == null || !dataLabelsProp.CanRead || !dataLabelsProp.CanWrite)
+                    return;
+
+                var dataLabels = dataLabelsProp.GetValue(series);
+                if (dataLabels == null)
+                {
+                    var labelsType = dataLabelsProp.PropertyType;
+                    var ctor = labelsType.GetConstructor(Type.EmptyTypes);
+                    if (ctor == null) return;
+
+                    dataLabels = ctor.Invoke(null);
+                    dataLabelsProp.SetValue(series, dataLabels);
+                }
+
+                var labelsType2 = dataLabels!.GetType();
+
+                SetBool(labelsType2, dataLabels, "ShowSeriesName", showSeriesName);
+                SetBool(labelsType2, dataLabels, "ShowValue", showValue);
+                SetBool(labelsType2, dataLabels, "ShowCategoryName", showCategoryName);
+                SetBool(labelsType2, dataLabels, "ShowLegendKey", false);
+                SetBool(labelsType2, dataLabels, "ShowPercentage", false);
+                SetBool(labelsType2, dataLabels, "ShowBubbleSize", false);
+
+                SetEnumByName(labelsType2, dataLabels, "Position", positionName);
+                SetEnumByName(labelsType2, dataLabels, "LabelPosition", positionName);
+            }
+            catch
+            {
+            }
+        }
+
+        private static void SetBool(Type type, object target, string propertyName, bool value)
+        {
+            PropertyInfo? p = type.GetProperty(propertyName);
+            if (p != null && p.CanWrite && p.PropertyType == typeof(bool))
+            {
+                p.SetValue(target, value);
+            }
+        }
+
+        private static void SetEnumByName(Type type, object target, string propertyName, string enumName)
+        {
+            PropertyInfo? p = type.GetProperty(propertyName);
+            if (p == null || !p.CanWrite) return;
+
+            Type pt = p.PropertyType;
+            if (!pt.IsEnum) return;
+
+            try
+            {
+                object enumValue = Enum.Parse(pt, enumName, true);
+                p.SetValue(target, enumValue);
+            }
+            catch
+            {
+            }
         }
 
         private static string? ResolveLabelForX(IReadOnlyList<MappedSeries> mapped, double x)
