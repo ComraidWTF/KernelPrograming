@@ -1,0 +1,534 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
+using Spreadsheet = DocumentFormat.OpenXml.Spreadsheet;
+using Xdr = DocumentFormat.OpenXml.Drawing.Spreadsheet;
+using A = DocumentFormat.OpenXml.Drawing;
+using C = DocumentFormat.OpenXml.Drawing.Charts;
+using LiveChartsCore;
+
+namespace WpfChartExcelExport
+{
+    /// <summary>
+    /// Single-file Open XML SDK exporter.
+    ///
+    /// NuGet packages:
+    /// - DocumentFormat.OpenXml
+    /// - LiveChartsCore
+    ///
+    /// Input:
+    /// - IEnumerable<ISeries> from LiveCharts2
+    /// - selectors that know how to read your point objects from each series.Values item
+    ///
+    /// Output:
+    /// - Creates a new .xlsx
+    /// - Writes:
+    ///     X Value
+    ///     X Meaning
+    ///     Y Meaning
+    ///     one Y column per series
+    /// - Builds a scatter chart with line+marker style
+    /// - Legend uses series names
+    /// - X/Y axis titles supported
+    /// - Axis labels formatted as whole numbers
+    /// - X Meaning and Y Meaning only written on whole-number X rows
+    /// </summary>
+    public static class OpenXmlLiveChartsExporter
+    {
+        public static void ExportScatterChart(
+            string outputPath,
+            IEnumerable<ISeries> series,
+            Func<object, double> xSelector,
+            Func<object, double?> ySelector,
+            Func<object, string?>? xMeaningSelector = null,
+            string? chartTitle = null,
+            string? xAxisTitle = null,
+            string? yAxisTitle = null,
+            string worksheetName = "Chart Data",
+            IComparer<double>? xComparer = null)
+        {
+            if (string.IsNullOrWhiteSpace(outputPath)) throw new ArgumentException("Output path is required.", nameof(outputPath));
+            if (series == null) throw new ArgumentNullException(nameof(series));
+            if (xSelector == null) throw new ArgumentNullException(nameof(xSelector));
+            if (ySelector == null) throw new ArgumentNullException(nameof(ySelector));
+
+            var mapped = series
+                .Select(MapSeries)
+                .Where(s => s != null)
+                .Cast<MappedSeries>()
+                .ToList();
+
+            if (mapped.Count == 0)
+                throw new InvalidOperationException("No LiveCharts2 series with a readable Values collection were found.");
+
+            var comparer = xComparer ?? Comparer<double>.Default;
+            var orderedX = mapped
+                .SelectMany(s => s.Points)
+                .Select(p => p.X)
+                .Distinct()
+                .OrderBy(v => v, comparer)
+                .ToList();
+
+            if (orderedX.Count == 0)
+                throw new InvalidOperationException("No data points found.");
+
+            if (System.IO.File.Exists(outputPath))
+                System.IO.File.Delete(outputPath);
+
+            using (var document = SpreadsheetDocument.Create(outputPath, SpreadsheetDocumentType.Workbook))
+            {
+                var workbookPart = document.AddWorkbookPart();
+                workbookPart.Workbook = new Spreadsheet.Workbook();
+
+                var worksheetPart = workbookPart.AddNewPart<WorksheetPart>();
+                var drawingsPart = worksheetPart.AddNewPart<DrawingsPart>();
+
+                var sheets = workbookPart.Workbook.AppendChild(new Spreadsheet.Sheets());
+                sheets.Append(new Spreadsheet.Sheet
+                {
+                    Id = workbookPart.GetIdOfPart(worksheetPart),
+                    SheetId = 1U,
+                    Name = worksheetName
+                });
+
+                const uint headerRowIndex = 1U;
+                const uint dataStartRowIndex = 2U;
+
+                const int xValueCol = 1;    // A
+                const int xMeaningCol = 2;  // B
+                const int yMeaningCol = 3;  // C
+                const int firstSeriesCol = 4; // D
+
+                var sheetData = new Spreadsheet.SheetData();
+                foreach (var row in BuildRows(mapped, orderedX, headerRowIndex, dataStartRowIndex, xValueCol, xMeaningCol, yMeaningCol, firstSeriesCol, xMeaningSelector, xAxisTitle, yAxisTitle, xSelector, ySelector))
+                {
+                    sheetData.Append(row);
+                }
+
+                worksheetPart.Worksheet = new Spreadsheet.Worksheet(
+                    new Spreadsheet.Columns(
+                        CreateColumn(1, 1, 12),
+                        CreateColumn(2, 2, 24),
+                        CreateColumn(3, 3, 18),
+                        CreateColumn((uint)firstSeriesCol, (uint)(firstSeriesCol + mapped.Count - 1), 14)
+                    ),
+                    sheetData,
+                    new Spreadsheet.Drawing { Id = worksheetPart.GetIdOfPart(drawingsPart) }
+                );
+                worksheetPart.Worksheet.Save();
+
+                drawingsPart.WorksheetDrawing = new Xdr.WorksheetDrawing();
+                AddScatterChart(
+                    drawingsPart,
+                    worksheetName,
+                    mapped,
+                    orderedX.Count,
+                    headerRowIndex,
+                    dataStartRowIndex,
+                    xValueCol,
+                    firstSeriesCol,
+                    chartTitle,
+                    xAxisTitle,
+                    yAxisTitle);
+                drawingsPart.WorksheetDrawing.Save();
+
+                workbookPart.Workbook.Save();
+            }
+
+            MappedSeries? MapSeries(ISeries s)
+            {
+                var valuesProp = s.GetType().GetProperty("Values");
+                if (valuesProp == null) return null;
+
+                var rawValues = valuesProp.GetValue(s) as IEnumerable;
+                if (rawValues == null) return null;
+
+                var nameProp = s.GetType().GetProperty("Name");
+                var name = nameProp?.GetValue(s)?.ToString();
+                if (string.IsNullOrWhiteSpace(name)) name = "Series";
+
+                var points = new List<MappedPoint>();
+                foreach (var item in rawValues)
+                {
+                    if (item == null) continue;
+                    var x = xSelector(item);
+                    var y = ySelector(item);
+                    var meaning = xMeaningSelector != null ? xMeaningSelector(item) : null;
+                    points.Add(new MappedPoint(x, y, meaning));
+                }
+
+                return new MappedSeries(name, points);
+            }
+        }
+
+        private static IEnumerable<Spreadsheet.Row> BuildRows(
+            IReadOnlyList<MappedSeries> mapped,
+            IReadOnlyList<double> orderedX,
+            uint headerRowIndex,
+            uint dataStartRowIndex,
+            int xValueCol,
+            int xMeaningCol,
+            int yMeaningCol,
+            int firstSeriesCol,
+            Func<object, string?>? xMeaningSelector,
+            string? xAxisTitle,
+            string? yAxisTitle,
+            Func<object, double> xSelector,
+            Func<object, double?> ySelector)
+        {
+            var rows = new List<Spreadsheet.Row>();
+
+            var header = new Spreadsheet.Row { RowIndex = headerRowIndex };
+            header.Append(
+                CreateTextCell(CellRef(xValueCol, headerRowIndex), string.IsNullOrWhiteSpace(xAxisTitle) ? "X Value" : xAxisTitle!),
+                CreateTextCell(CellRef(xMeaningCol, headerRowIndex), "X Meaning"),
+                CreateTextCell(CellRef(yMeaningCol, headerRowIndex), string.IsNullOrWhiteSpace(yAxisTitle) ? "Y Meaning" : yAxisTitle!)
+            );
+
+            for (int i = 0; i < mapped.Count; i++)
+            {
+                header.Append(CreateTextCell(CellRef(firstSeriesCol + i, headerRowIndex), mapped[i].Name));
+            }
+
+            rows.Add(header);
+
+            var lookups = mapped
+                .Select(s => s.Points
+                    .GroupBy(p => p.X)
+                    .ToDictionary(g => g.Key, g => g.Last()))
+                .ToList();
+
+            for (int i = 0; i < orderedX.Count; i++)
+            {
+                uint rowIndex = dataStartRowIndex + (uint)i;
+                double x = orderedX[i];
+
+                var row = new Spreadsheet.Row { RowIndex = rowIndex };
+                row.Append(CreateNumberCell(CellRef(xValueCol, rowIndex), x));
+
+                bool isWhole = Math.Abs(x - Math.Round(x)) < 1e-9;
+                string? xMeaning = isWhole ? ResolveLabelForX(mapped, x) : null;
+
+                row.Append(CreateTextCell(CellRef(xMeaningCol, rowIndex), xMeaning ?? string.Empty));
+                row.Append(CreateTextCell(CellRef(yMeaningCol, rowIndex), isWhole ? (yAxisTitle ?? string.Empty) : string.Empty));
+
+                for (int s = 0; s < mapped.Count; s++)
+                {
+                    if (lookups[s].TryGetValue(x, out var point) && point.Y.HasValue)
+                    {
+                        row.Append(CreateNumberCell(CellRef(firstSeriesCol + s, rowIndex), point.Y.Value));
+                    }
+                    else
+                    {
+                        row.Append(CreateBlankCell(CellRef(firstSeriesCol + s, rowIndex)));
+                    }
+                }
+
+                rows.Add(row);
+            }
+
+            return rows;
+        }
+
+        private static void AddScatterChart(
+            DrawingsPart drawingsPart,
+            string worksheetName,
+            IReadOnlyList<MappedSeries> mapped,
+            int pointCount,
+            uint headerRowIndex,
+            uint dataStartRowIndex,
+            int xValueCol,
+            int firstSeriesCol,
+            string? chartTitle,
+            string? xAxisTitle,
+            string? yAxisTitle)
+        {
+            var chartPart = drawingsPart.AddNewPart<ChartPart>();
+            GenerateChartPartContent(chartPart, worksheetName, mapped, pointCount, headerRowIndex, dataStartRowIndex, xValueCol, firstSeriesCol, chartTitle, xAxisTitle, yAxisTitle);
+
+            string chartRelId = drawingsPart.GetIdOfPart(chartPart);
+
+            var graphicFrame = new Xdr.GraphicFrame(
+                new Xdr.NonVisualGraphicFrameProperties(
+                    new Xdr.NonVisualDrawingProperties { Id = 2U, Name = "Scatter Chart" },
+                    new Xdr.NonVisualGraphicFrameDrawingProperties()
+                ),
+                new Xdr.Transform(
+                    new A.Offset { X = 0L, Y = 0L },
+                    new A.Extents { Cx = 0L, Cy = 0L }
+                ),
+                new A.Graphic(
+                    new A.GraphicData(
+                        new C.ChartReference { Id = chartRelId }
+                    )
+                    { Uri = "http://schemas.openxmlformats.org/drawingml/2006/chart" }
+                )
+            );
+
+            var anchor = new Xdr.TwoCellAnchor(
+                new Xdr.FromMarker(
+                    new Xdr.ColumnId("0"),
+                    new Xdr.ColumnOffset("0"),
+                    new Xdr.RowId((dataStartRowIndex + (uint)pointCount + 2).ToString(CultureInfo.InvariantCulture)),
+                    new Xdr.RowOffset("0")
+                ),
+                new Xdr.ToMarker(
+                    new Xdr.ColumnId("14"),
+                    new Xdr.ColumnOffset("0"),
+                    new Xdr.RowId((dataStartRowIndex + (uint)pointCount + 22).ToString(CultureInfo.InvariantCulture)),
+                    new Xdr.RowOffset("0")
+                ),
+                graphicFrame,
+                new Xdr.ClientData()
+            );
+
+            drawingsPart.WorksheetDrawing.Append(anchor);
+        }
+
+        private static void GenerateChartPartContent(
+            ChartPart chartPart,
+            string worksheetName,
+            IReadOnlyList<MappedSeries> mapped,
+            int pointCount,
+            uint headerRowIndex,
+            uint dataStartRowIndex,
+            int xValueCol,
+            int firstSeriesCol,
+            string? chartTitle,
+            string? xAxisTitle,
+            string? yAxisTitle)
+        {
+            const uint xAxisId = 48650112U;
+            const uint yAxisId = 48672768U;
+
+            var chartSpace = new C.ChartSpace();
+            chartSpace.Append(new C.EditingLanguage { Val = "en-US" });
+
+            var chart = new C.Chart();
+
+            if (!string.IsNullOrWhiteSpace(chartTitle))
+                chart.Append(CreateChartTitle(chartTitle!));
+
+            chart.Append(new C.AutoTitleDeleted { Val = false });
+
+            var plotArea = new C.PlotArea();
+            plotArea.Append(new C.Layout());
+
+            var scatterChart = new C.ScatterChart(
+                new C.ScatterStyle { Val = C.ScatterStyleValues.LineMarker },
+                new C.VaryColors { Val = false }
+            );
+
+            string xRange = RangeRef(worksheetName, xValueCol, dataStartRowIndex, xValueCol, dataStartRowIndex + (uint)pointCount - 1);
+
+            for (int i = 0; i < mapped.Count; i++)
+            {
+                int yCol = firstSeriesCol + i;
+                string yRange = RangeRef(worksheetName, yCol, dataStartRowIndex, yCol, dataStartRowIndex + (uint)pointCount - 1);
+                string titleRef = RangeRef(worksheetName, yCol, headerRowIndex, yCol, headerRowIndex);
+
+                var ser = new C.ScatterChartSeries(
+                    new C.Index { Val = (uint)i },
+                    new C.Order { Val = (uint)i },
+                    new C.SeriesText(new C.StringReference(new C.Formula(titleRef))),
+                    new C.Marker(
+                        new C.Symbol { Val = C.MarkerStyleValues.Circle },
+                        new C.Size { Val = 7 }),
+                    new C.XValues(new C.NumberReference(new C.Formula(xRange))),
+                    new C.YValues(new C.NumberReference(new C.Formula(yRange)))
+                );
+
+                scatterChart.Append(ser);
+            }
+
+            scatterChart.Append(new C.AxisId { Val = xAxisId });
+            scatterChart.Append(new C.AxisId { Val = yAxisId });
+
+            plotArea.Append(scatterChart);
+
+            // Scatter charts use value axes on both X and Y.
+            plotArea.Append(CreateValueAxis(xAxisId, yAxisId, xAxisTitle, C.AxisPositionValues.Bottom));
+            plotArea.Append(CreateValueAxis(yAxisId, xAxisId, yAxisTitle, C.AxisPositionValues.Left));
+
+            chart.Append(plotArea);
+            chart.Append(new C.PlotVisibleOnly { Val = true });
+            chart.Append(new C.Legend(
+                new C.LegendPosition { Val = C.LegendPositionValues.Right },
+                new C.Layout(),
+                new C.Overlay { Val = false }
+            ));
+
+            chartSpace.Append(chart);
+            chartPart.ChartSpace = chartSpace;
+        }
+
+        private static C.Title CreateChartTitle(string text)
+        {
+            return new C.Title(
+                new C.ChartText(
+                    new C.RichText(
+                        new A.BodyProperties(),
+                        new A.ListStyle(),
+                        new A.Paragraph(
+                            new A.Run(
+                                new A.RunProperties { Language = "en-US" },
+                                new A.Text(text)
+                            )
+                        )
+                    )
+                ),
+                new C.Layout(),
+                new C.Overlay { Val = false }
+            );
+        }
+
+        private static C.ValueAxis CreateValueAxis(uint axisId, uint crossesAxisId, string? title, C.AxisPositionValues position)
+        {
+            return new C.ValueAxis(
+                new C.AxisId { Val = axisId },
+                new C.Scaling(new C.Orientation { Val = C.OrientationValues.MinMax }),
+                new C.Delete { Val = false },
+                new C.AxisPosition { Val = position },
+                CreateAxisTitle(title),
+                new C.NumberingFormat { FormatCode = "0", SourceLinked = false },
+                new C.MajorGridlines(),
+                new C.MajorTickMark { Val = C.TickMarkValues.Outside },
+                new C.MinorTickMark { Val = C.TickMarkValues.None },
+                new C.TickLabelPosition { Val = C.TickLabelPositionValues.NextTo },
+                new C.CrossingAxis { Val = crossesAxisId },
+                new C.Crosses { Val = C.CrossesValues.AutoZero },
+                new C.CrossBetween { Val = C.CrossBetweenValues.MidpointCategory }
+            );
+        }
+
+        private static OpenXmlElement CreateAxisTitle(string? title)
+        {
+            if (string.IsNullOrWhiteSpace(title))
+                return new C.Title(new C.Layout(), new C.Overlay { Val = false });
+
+            return new C.Title(
+                new C.ChartText(
+                    new C.RichText(
+                        new A.BodyProperties(),
+                        new A.ListStyle(),
+                        new A.Paragraph(
+                            new A.Run(
+                                new A.RunProperties { Language = "en-US" },
+                                new A.Text(title)
+                            )
+                        )
+                    )
+                ),
+                new C.Layout(),
+                new C.Overlay { Val = false }
+            );
+        }
+
+        private static Spreadsheet.Column CreateColumn(uint min, uint max, double width)
+        {
+            return new Spreadsheet.Column
+            {
+                Min = min,
+                Max = max,
+                Width = width,
+                CustomWidth = true
+            };
+        }
+
+        private static Spreadsheet.Cell CreateTextCell(string cellReference, string text)
+        {
+            return new Spreadsheet.Cell
+            {
+                CellReference = cellReference,
+                DataType = Spreadsheet.CellValues.InlineString,
+                InlineString = new Spreadsheet.InlineString(new Spreadsheet.Text(text))
+            };
+        }
+
+        private static Spreadsheet.Cell CreateNumberCell(string cellReference, double value)
+        {
+            return new Spreadsheet.Cell
+            {
+                CellReference = cellReference,
+                DataType = Spreadsheet.CellValues.Number,
+                CellValue = new Spreadsheet.CellValue(value.ToString(CultureInfo.InvariantCulture))
+            };
+        }
+
+        private static Spreadsheet.Cell CreateBlankCell(string cellReference)
+        {
+            return new Spreadsheet.Cell { CellReference = cellReference };
+        }
+
+        private static string CellRef(int colIndex1Based, uint rowIndex1Based)
+        {
+            return ColumnName(colIndex1Based) + rowIndex1Based.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string ColumnName(int columnNumber)
+        {
+            int dividend = columnNumber;
+            string columnName = string.Empty;
+
+            while (dividend > 0)
+            {
+                int modifier = (dividend - 1) % 26;
+                columnName = Convert.ToChar(65 + modifier) + columnName;
+                dividend = (dividend - modifier - 1) / 26;
+            }
+
+            return columnName;
+        }
+
+        private static string RangeRef(string sheetName, int fromCol, uint fromRow, int toCol, uint toRow)
+        {
+            return "'" + sheetName + "'!$" + ColumnName(fromCol) + "$" + fromRow.ToString(CultureInfo.InvariantCulture)
+                + ":$" + ColumnName(toCol) + "$" + toRow.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static string? ResolveLabelForX(IReadOnlyList<MappedSeries> mapped, double x)
+        {
+            return mapped
+                .SelectMany(s => s.Points)
+                .Where(p => Math.Abs(p.X - x) < 1e-9)
+                .Select(p => p.XMeaning)
+                .FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+        }
+
+        public sealed class SeriesInput<T>
+        {
+            public string Name { get; set; } = string.Empty;
+            public IEnumerable<T> Values { get; set; } = Array.Empty<T>();
+        }
+
+        private sealed class MappedSeries
+        {
+            public MappedSeries(string name, List<MappedPoint> points)
+            {
+                Name = name;
+                Points = points;
+            }
+
+            public string Name { get; }
+            public List<MappedPoint> Points { get; }
+        }
+
+        private sealed class MappedPoint
+        {
+            public MappedPoint(double x, double? y, string? xMeaning)
+            {
+                X = x;
+                Y = y;
+                XMeaning = xMeaning;
+            }
+
+            public double X { get; }
+            public double? Y { get; }
+            public string? XMeaning { get; }
+        }
+    }
+}
