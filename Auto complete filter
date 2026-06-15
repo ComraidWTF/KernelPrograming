@@ -1,0 +1,114 @@
+// MainWindow.xaml.cs
+
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Windows;
+
+namespace WpfApp;
+
+public partial class MainWindow : Window
+{
+    public MainWindow()
+    {
+        InitializeComponent();
+        DataContext = new MainVm();
+    }
+}
+
+public sealed class MainVm : BindableBase
+{
+    public ObservableCollection<ItemVm> AllItems { get; } = new();
+    public ObservableCollection<RowVm> Rows { get; } = new();
+
+    public MainVm()
+    {
+        AllItems.Add(new ItemVm(1, "Apple"));
+        AllItems.Add(new ItemVm(2, "Banana"));
+        AllItems.Add(new ItemVm(3, "Orange"));
+        AllItems.Add(new ItemVm(4, "Mango"));
+
+        Rows.Add(new RowVm(this));
+        Rows.Add(new RowVm(this));
+        Rows.Add(new RowVm(this));
+    }
+
+    public void RefreshAllRows()
+    {
+        foreach (RowVm row in Rows)
+            row.RefreshAvailableItems();
+    }
+}
+
+public sealed class RowVm : BindableBase
+{
+    private readonly MainVm parent;
+    private ItemVm? selectedItem;
+
+    public RowVm(MainVm parent)
+    {
+        this.parent = parent;
+    }
+
+    public IEnumerable<ItemVm> AvailableItems =>
+        parent.AllItems.Where(item =>
+            SelectedItem?.Id == item.Id ||
+            !parent.Rows.Any(row =>
+                row != this &&
+                row.SelectedItem?.Id == item.Id));
+
+    public ItemVm? SelectedItem
+    {
+        get => selectedItem;
+        set
+        {
+            if (SetProperty(ref selectedItem, value))
+                parent.RefreshAllRows();
+        }
+    }
+
+    public void RefreshAvailableItems()
+    {
+        RaisePropertyChanged(nameof(AvailableItems));
+    }
+}
+
+public sealed class ItemVm
+{
+    public ItemVm(int id, string name)
+    {
+        Id = id;
+        Name = name;
+    }
+
+    public int Id { get; }
+    public string Name { get; }
+
+    public override string ToString() => Name;
+}
+
+public abstract class BindableBase : INotifyPropertyChanged
+{
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    protected bool SetProperty<T>(
+        ref T storage,
+        T value,
+        [CallerMemberName] string? propertyName = null)
+    {
+        if (EqualityComparer<T>.Default.Equals(storage, value))
+            return false;
+
+        storage = value;
+        RaisePropertyChanged(propertyName);
+        return true;
+    }
+
+    protected void RaisePropertyChanged(
+        [CallerMemberName] string? propertyName = null)
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
+}
