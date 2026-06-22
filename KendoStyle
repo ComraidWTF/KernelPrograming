@@ -1,0 +1,42 @@
+.k-popup {
+  .k-treeview,
+  .k-treeview-item,
+  .k-treeview-leaf,
+  .k-input-inner,
+  .k-searchbox,
+  .k-svg-icon {
+    color: var(--kendo-color-on-app-surface);
+  }
+
+  .k-treeview-leaf:hover,
+  .k-treeview-leaf.k-hover {
+    background-color: var(--kendo-color-primary-subtle);
+    color: var(--kendo-color-on-primary);
+  }
+
+  .k-treeview-leaf.k-selected {
+    background-color: var(--kendo-color-primary);
+    color: var(--kendo-color-on-primary);
+  }
+}
+
+
+
+kendo-multiselecttree {
+  .k-input-inner,
+  .k-input-value-text,
+  .k-chip-label,
+  .k-placeholder,
+  .k-svg-icon,
+  .k-button-icon {
+    color: var(--kendo-color-on-primary) !important;
+  }
+
+  .k-input,
+  .k-picker,
+  .k-multiselect {
+    background-color: var(--kendo-color-primary);
+    color: var(--kendo-color-on-primary);
+    border-color: var(--kendo-color-primary);
+  }
+}
