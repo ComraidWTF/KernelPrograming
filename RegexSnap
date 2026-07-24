@@ -1,0 +1,1 @@
+var regex = new Regex(@"^[A-Z0-9]+_[A-Z]+_[A-Z0-9]+$");
