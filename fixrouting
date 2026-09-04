@@ -1,0 +1,21 @@
+contactPoints:
+  - orgId: 1
+    name: cleanarch-oncall
+    receivers:
+      - uid: cleanarch-slack
+        type: slack
+        settings:
+          url: https://hooks.slack.com/services/YOUR/WEBHOOK
+
+policies:
+  - orgId: 1
+    receiver: cleanarch-oncall
+    group_by: [alertname, service]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    routes:
+      - receiver: cleanarch-oncall
+        object_matchers:
+          - ['severity', '=', 'critical']
+        repeat_interval: 1h
