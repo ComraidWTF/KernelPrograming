@@ -1,0 +1,48 @@
+# ── Sending them somewhere ───────────────────────────────────────────────────
+# Secrets come from the environment — see .env.example. Grafana interpolates
+# $VAR here at startup. An unset variable becomes an empty string and Grafana
+# starts anyway, so always hit Test after changing this.
+#
+# This `policies:` block REPLACES Grafana's entire notification tree including
+# the default route. Everything in org 1 now routes through here.
+
+contactPoints:
+  # Warnings and everything else.
+  - orgId: 1
+    name: cleanarch-slack
+    receivers:
+      - uid: cleanarch-slack
+        type: slack
+        settings:
+          url: $SLACK_WEBHOOK_URL
+          # If you add {{ $labels.x }} to a title or text, write {{ $$labels.x }}.
+          # A single $ gets eaten by env interpolation before Grafana sees it.
+          title: '{{ .CommonLabels.alertname }} — {{ .CommonLabels.service }}'
+
+  # Critical only: Slack AND email, so nothing quiet gets missed.
+  - orgId: 1
+    name: cleanarch-critical
+    receivers:
+      - uid: cleanarch-critical-slack
+        type: slack
+        settings:
+          url: $SLACK_WEBHOOK_URL
+          title: '🔴 {{ .CommonLabels.alertname }} — {{ .CommonLabels.service }}'
+      - uid: cleanarch-critical-email
+        type: email
+        settings:
+          addresses: $ALERT_EMAIL_TO
+          singleEmail: false
+
+policies:
+  - orgId: 1
+    receiver: cleanarch-slack
+    group_by: [alertname, service]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    routes:
+      - receiver: cleanarch-critical
+        matchers:
+          - severity = critical
+        repeat_interval: 1h
