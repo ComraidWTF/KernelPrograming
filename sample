@@ -1,0 +1,27 @@
+# ── Grafana: alert delivery ──────────────────────────────────────────────────
+# cp .env.example .env and fill these in. .env is gitignored.
+
+# Slack incoming webhook. api.slack.com/apps -> your app -> Incoming Webhooks.
+# The channel is baked into the webhook itself.
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXX
+
+# Semicolon-separated, not comma.
+ALERT_EMAIL_TO=oncall@example.com;backup@example.com
+
+# ── Grafana: SMTP ────────────────────────────────────────────────────────────
+# host:port — the port is not optional.
+SMTP_HOST=smtp.example.com:587
+SMTP_USER=grafana@example.com
+# Gmail/Workspace wants an app password here, not the account password.
+# Avoid a value containing $ — compose interpolation will mangle it.
+SMTP_PASSWORD=
+SMTP_FROM_ADDRESS=grafana@example.com
+SMTP_FROM_NAME=CleanArch Grafana
+# NoStartTLS | OpportunisticStartTLS | MandatoryStartTLS
+# 587 -> MandatoryStartTLS. 465 -> implicit TLS, detected from the port.
+SMTP_STARTTLS_POLICY=MandatoryStartTLS
+SMTP_SKIP_VERIFY=false
+
+# Absolute URL used for the links inside alert emails and Slack messages.
+# Wrong value here = every "View alert" button is broken.
+GRAFANA_ROOT_URL=http://localhost:3000
