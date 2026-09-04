@@ -1,0 +1,15 @@
+grafana:
+    # keep your existing image tag
+    env_file: .env          # puts SLACK_WEBHOOK_URL + ALERT_EMAIL_TO in the
+                            # container, which is what provisioning reads
+    environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:?set GRAFANA_ROOT_URL in .env}
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: ${SMTP_HOST:?set SMTP_HOST in .env}
+      GF_SMTP_USER: ${SMTP_USER}
+      GF_SMTP_PASSWORD: ${SMTP_PASSWORD}
+      GF_SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS}
+      GF_SMTP_FROM_NAME: ${SMTP_FROM_NAME}
+      GF_SMTP_STARTTLS_POLICY: ${SMTP_STARTTLS_POLICY:-MandatoryStartTLS}
+      GF_SMTP_SKIP_VERIFY: ${SMTP_SKIP_VERIFY:-false}
+    # your existing provisioning mount stays as-is
