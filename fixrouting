@@ -6,6 +6,11 @@ contactPoints:
         type: slack
         settings:
           url: https://hooks.slack.com/services/YOUR/WEBHOOK
+      - uid: cleanarch-email
+        type: email
+        settings:
+          addresses: oncall@example.com
+          singleEmail: false
 
 policies:
   - orgId: 1
